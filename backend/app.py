@@ -191,7 +191,7 @@ def db():
                 for name,ddl in migrations.items():
                     if name not in existing: c.execute(ddl)
                 # Existing accounts pre-date email verification, so don't lock them out during migration.
-                c.execute('UPDATE users SET email_verified=1 WHERE email_verified IS NULL')
+                c.execute("UPDATE users SET email_verified=1 WHERE email_verified IS NULL OR (email_verified=0 AND COALESCE(verification_code_hash,'')='')")
                 now=int(time.time())
                 c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('history_retention_enabled','1')")
                 c.execute("INSERT OR IGNORE INTO community_settings(id,name,bio,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','A place for PMA members to learn, share and discuss the markets.','',604800,?)",(now,))
