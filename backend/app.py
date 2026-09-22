@@ -94,6 +94,7 @@ class Msg(BaseModel):
     text: str = ''
     media_data: str = ''
     media_type: str = ''
+    reply_to_id: int = 0
 
 class CommunityRequest(BaseModel):
     action: str = 'request'
@@ -105,8 +106,9 @@ class CommunityModeration(BaseModel):
 
 class CommunitySettings(BaseModel):
     name: str = 'PMA Community'
+    bio: str = 'A place for PMA members to learn, share and discuss the markets.'
     profile_picture: str = ''
-    disappearing_seconds: int = 0
+    disappearing_seconds: int = 604800
 
 
 class Profile(BaseModel):
@@ -145,9 +147,9 @@ def db():
             if not _DB_READY:
                 c.executescript('''
                 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, full_name TEXT, email TEXT UNIQUE, password TEXT, pma_id TEXT UNIQUE, referral_code TEXT UNIQUE, referrer TEXT, role TEXT DEFAULT 'user', phone TEXT DEFAULT '', dob TEXT DEFAULT '', profile_picture TEXT DEFAULT '', created INTEGER, xp INTEGER DEFAULT 0, last_active INTEGER DEFAULT 0, login_count INTEGER DEFAULT 0, activity_count INTEGER DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '', media_type TEXT DEFAULT '', created INTEGER);
+                CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '', media_type TEXT DEFAULT '', reply_to_id INTEGER DEFAULT 0, edited INTEGER DEFAULT 0, created INTEGER);
                 CREATE TABLE IF NOT EXISTS community_members(user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member', warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0, note TEXT DEFAULT '');
-                CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', profile_picture TEXT DEFAULT '', disappearing_seconds INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.', profile_picture TEXT DEFAULT '', disappearing_seconds INTEGER DEFAULT 604800, updated_at INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0, target_page TEXT DEFAULT '', target_ref TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE IF NOT EXISTS referrals(id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, referred_id INTEGER NOT NULL, challenge_month TEXT NOT NULL, status TEXT DEFAULT 'pending', created INTEGER NOT NULL, qualification_due INTEGER NOT NULL, qualified_at INTEGER, flagged INTEGER DEFAULT 0, reason TEXT DEFAULT '', UNIQUE(referrer_id,referred_id));
@@ -159,6 +161,11 @@ def db():
                 CREATE TABLE IF NOT EXISTS trade_history(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, market TEXT NOT NULL, timeframe TEXT NOT NULL, direction TEXT NOT NULL, entry REAL, stop_loss REAL, take_profit REAL, outcome TEXT NOT NULL, reason TEXT DEFAULT '', opened_at INTEGER NOT NULL, closed_at INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS signal_history(id INTEGER PRIMARY KEY, user_id INTEGER, symbol TEXT NOT NULL, market TEXT NOT NULL, timeframe TEXT NOT NULL, direction TEXT NOT NULL, status TEXT NOT NULL, setup_strength REAL, entry REAL, stop_loss REAL, take_profit REAL, reason TEXT DEFAULT '', event_key TEXT UNIQUE, created INTEGER NOT NULL);
                 ''')
+                message_existing={r['name'] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
+                if 'reply_to_id' not in message_existing: c.execute("ALTER TABLE messages ADD COLUMN reply_to_id INTEGER DEFAULT 0")
+                if 'edited' not in message_existing: c.execute("ALTER TABLE messages ADD COLUMN edited INTEGER DEFAULT 0")
+                community_settings_existing={r['name'] for r in c.execute("PRAGMA table_info(community_settings)").fetchall()}
+                if 'bio' not in community_settings_existing: c.execute("ALTER TABLE community_settings ADD COLUMN bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.'")
                 notif_existing={r['name'] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
                 if 'target_page' not in notif_existing: c.execute("ALTER TABLE notifications ADD COLUMN target_page TEXT DEFAULT ''")
                 if 'target_ref' not in notif_existing: c.execute("ALTER TABLE notifications ADD COLUMN target_ref TEXT DEFAULT ''")
@@ -166,9 +173,10 @@ def db():
                 for name,ddl in {'xp':'ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0','last_active':'ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0','login_count':'ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0','activity_count':'ALTER TABLE users ADD COLUMN activity_count INTEGER DEFAULT 0'}.items():
                     if name not in existing: c.execute(ddl)
                 now=int(time.time())
-                c.execute("INSERT OR IGNORE INTO community_settings(id,name,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','',0,?)",(now,))
-                c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('community_locked','0')")
-                c.execute('CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created DESC)')
+                c.execute("INSERT OR IGNORE INTO community_settings(id,name,bio,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','A place for PMA members to learn, share and discuss the markets.','',604800,?)",(now,))
+                if c.execute("SELECT 1 FROM settings WHERE key='community_default_retention_v1'").fetchone() is None:
+                    c.execute("UPDATE community_settings SET disappearing_seconds=604800 WHERE id=1 AND COALESCE(disappearing_seconds,0)=0")
+                    c.execute("INSERT INTO settings(key,value) VALUES('community_default_retention_v1','1')")
                 c.execute("INSERT OR IGNORE INTO community_members(user_id,status,role,joined_at,updated_at) SELECT id,'approved',CASE WHEN role='admin' THEN 'admin' ELSE 'member' END,?,? FROM users",(now,now))
                 c.execute('DELETE FROM notifications WHERE created < ?',(now-14*86400,))
                 c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(username,created DESC)')
@@ -647,51 +655,6 @@ def candles(symbol: str='EURUSD', timeframe: str='15m'):
         raise HTTPException(503,f'Live candle feed unavailable: {ex}')
 
 
-def prepare_yahoo_market_setup(symbol, market, trigger_timeframe='15m'):
-    """Fast verified fallback for non-Forex day-trade categories.
-    Fetches all required Yahoo frames in parallel, then runs the same PMA setup engine.
-    This avoids serial provider retries when TradingView has no row for an index/commodity.
-    """
-    trigger_timeframe = trigger_timeframe if trigger_timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m'
-    frame_names=('15m','30m','1h','4h','1d')
-    all_frames=tuple(dict.fromkeys(frame_names+(trigger_timeframe,)))
-    with ThreadPoolExecutor(max_workers=len(all_frames)) as pool:
-        jobs={pool.submit(fetch,symbol,tf):tf for tf in all_frames}
-        fetched={jobs[job]:job.result() for job in as_completed(jobs)}
-    frames={tf:fetched[tf] for tf in frame_names}
-    trigger_rows=fetched[trigger_timeframe]
-    setup=analyze_setup(trigger_rows,frames,trigger_timeframe)
-    trends={tf:trend_info(frames[tf]) for tf in frames}
-    validation=backtest(trigger_rows)
-    psize=pip_size(symbol)
-    return {
-        'symbol':symbol.upper(),'market':market,'direction':setup['direction'],'setup_strength':setup['score'],'status':setup['status'],
-        'entry_zone':round(setup['entry_zone'],8) if setup['entry_zone'] is not None else None,
-        'entry_note':'Use the zone as a planning area, not an exact guaranteed fill.',
-        'stop_loss':round(setup['stop_loss'],8) if setup['stop_loss'] is not None else None,
-        'take_profit_1':round(setup['take_profit_1'],8) if setup['take_profit_1'] is not None else None,
-        'take_profit_2':round(setup['take_profit_2'],8) if setup['take_profit_2'] is not None else None,
-        'risk_reward':'1:1 / 1:2 target framework' if setup['direction']!='NO TRADE' else '—',
-        'zone_type':setup.get('next_zone_type'),'next_zone':round(setup['next_zone'],8) if setup['next_zone'] is not None else None,
-        'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,
-        'distance_to_entry_zone':round(abs(setup['entry_zone']-setup['last']),8) if setup['entry_zone'] is not None else None,
-        'pips_to_entry_zone':round(abs(setup['entry_zone']-setup['last'])/psize,1) if setup['entry_zone'] is not None else None,
-        'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
-        'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),
-        'timeframe':trigger_timeframe,'atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),
-        'support':round(setup['support'],8) if setup['support'] is not None else None,
-        'resistance':round(setup['resistance'],8) if setup['resistance'] is not None else None,
-        'rsi_trigger':setup['rsi'],'structure':setup['structure'],
-        'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,
-        'next_signal_status':'TRIGGERED' if setup['status']=='SIGNAL READY' else 'WAITING FOR CONFIRMATION',
-        'trade_state':'ACTIVE' if setup['status']=='SIGNAL READY' else setup['status'],
-        'next_signal_trigger':setup['trigger_text'],'reasons':setup['reasons'],
-        'trends':{tf:trends[tf]['trend'] for tf in trends},'trend_detail':trends,
-        'trend_alignment':f"{sum(1 for v in trends.values() if v['trend']==setup['trend'])}/5" if setup['trend']!='Neutral' else '0/5',
-        'validation':validation,'data_source':'Verified Yahoo Finance chart feed','updated_at':utc_iso(),
-        'method':'PMA confluence engine: verified Yahoo candles + trend + RSI + structure + MTF alignment + ATR zone projection'
-    }
-
 @app.get('/api/day-trade/plan')
 def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJPY,XAUUSD,BTCUSD', timeframe: str='15m'):
     requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:8]
@@ -702,13 +665,7 @@ def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJP
     try: batch=_tv_scan_many(requested,market,tfs)
     except Exception as ex: errors.append({'scope':'batch','error':str(ex)})
     def build(sym):
-        # Forex/Crypto keep the fast TradingView batch path. Indices/Metals/Commodities
-        # use the verified Yahoo candle engine directly so a missing TradingView row
-        # cannot force a slow chain of provider retries.
-        if market in ('Metals','Commodities','Indices') and sym not in batch:
-            setup=prepare_yahoo_market_setup(sym,market,timeframe)
-        else:
-            setup=prepare_market_setup(sym,market,timeframe,batch.get(sym))
+        setup=prepare_market_setup(sym,market,timeframe,batch.get(sym))
         context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
         setup['day_trade_state']='READY' if context_ok and setup['status']=='SIGNAL READY' else ('FORECAST' if setup['direction']!='NO TRADE' else setup['status'])
         setup['day_trade_reason']=f"{timeframe} forecast is aligned with 1H and 4H context." if context_ok else 'Trend is context only. Wait for the planned pullback, sniper candle confirmation and risk trigger before entering.'
@@ -764,19 +721,6 @@ def signal_history(req: Request, days: int = 7, limit: int = 200):
     u=current(req); c=db(); cutoff=int(time.time())-max(1,min(days,30))*86400
     rows=c.execute('SELECT * FROM signal_history WHERE (user_id=? OR user_id IS NULL) AND created>=? ORDER BY created DESC LIMIT ?', (u['id'],cutoff,max(1,min(limit,500)))).fetchall(); c.close()
     return {'days':days,'signals':[dict(r) for r in rows]}
-
-@app.get('/api/history')
-def unified_history(req: Request, history_type: str='all', days: int=7, limit: int=200):
-    u=current(req); days=max(1,min(int(days or 7),30)); limit=max(1,min(int(limit or 200),500)); cutoff=int(time.time())-days*86400
-    c=db(); items=[]
-    if history_type in ('all','day-trade','trade'):
-        rows=c.execute('SELECT * FROM trade_history WHERE user_id=? AND closed_at>=? ORDER BY closed_at DESC LIMIT ?', (u['id'],cutoff,limit)).fetchall()
-        for r in rows: items.append({'type':'day-trade','id':r['id'],'symbol':r['symbol'],'market':r['market'],'timeframe':r['timeframe'],'direction':r['direction'],'status':r['outcome'],'strength':None,'entry':r['entry'],'stop_loss':r['stop_loss'],'take_profit':r['take_profit'],'reason':r['reason'],'created':r['closed_at']})
-    if history_type in ('all','signals','scanner'):
-        rows=c.execute('SELECT * FROM signal_history WHERE (user_id=? OR user_id IS NULL) AND created>=? ORDER BY created DESC LIMIT ?', (u['id'],cutoff,limit)).fetchall()
-        for r in rows: items.append({'type':'scanner','id':r['id'],'symbol':r['symbol'],'market':r['market'],'timeframe':r['timeframe'],'direction':r['direction'],'status':r['status'],'strength':r['setup_strength'],'entry':r['entry'],'stop_loss':r['stop_loss'],'take_profit':r['take_profit'],'reason':r['reason'],'created':r['created']})
-    c.close(); items.sort(key=lambda x:x['created'],reverse=True)
-    return {'days':days,'history_type':history_type,'items':items[:limit]}
 
 @app.get('/api/feedback/summary')
 def feedback_summary(req: Request):
@@ -896,7 +840,7 @@ def complete_task(req: Request, x: Completion):
 
 def community_settings_row(c):
     r=c.execute('SELECT * FROM community_settings WHERE id=1').fetchone()
-    return {'name':r['name'] if r else 'PMA Community','profile_picture':r['profile_picture'] if r else '', 'disappearing_seconds':int(r['disappearing_seconds'] or 0) if r else 0}
+    return {'name':r['name'] if r else 'PMA Community','bio':r['bio'] if r and 'bio' in r.keys() else 'A place for PMA members to learn, share and discuss the markets.','profile_picture':r['profile_picture'] if r else '', 'disappearing_seconds':int(r['disappearing_seconds'] or 0) if r else 604800}
 
 def community_member(c,user_id):
     return c.execute('SELECT * FROM community_members WHERE user_id=?',(user_id,)).fetchone()
@@ -928,34 +872,59 @@ def community_join(req: Request, x: CommunityRequest):
     for a in admins: push_notice(c,a['username'],'Community join request',f"{u['username']} requested access to the community.",'community')
     c.commit(); c.close(); return {'ok':True,'status':'pending'}
 
+@app.get('/api/community/members')
+def community_member_list(req: Request):
+    u,c,m=require_community_member(req)
+    rows=c.execute("SELECT u.id,u.username,u.full_name,u.pma_id,u.profile_picture,u.role,cm.status,cm.joined_at FROM users u JOIN community_members cm ON cm.user_id=u.id WHERE cm.status='approved' ORDER BY CASE WHEN u.role='admin' THEN 0 ELSE 1 END,u.username COLLATE NOCASE").fetchall()
+    c.close()
+    return {'members':[dict(r) for r in rows]}
+
 @app.get('/api/community/messages')
 def get_messages(req: Request, q: str=''):
     u,c,m=require_community_member(req); locked=get_locked(c); settings=community_settings_row(c)
-    if q.strip(): rows=c.execute('SELECT * FROM messages WHERE text LIKE ? ORDER BY id ASC LIMIT 300',(f'%{q.strip()}%',)).fetchall()
-    else: rows=list(reversed(c.execute('SELECT * FROM messages ORDER BY id DESC LIMIT 300').fetchall()))
+    cutoff=int(time.time())-int(settings['disappearing_seconds'] or 0) if settings['disappearing_seconds'] else 0
+    if cutoff:
+        c.execute('DELETE FROM messages WHERE created<?',(cutoff,)); c.commit()
+    if q.strip(): rows=c.execute('SELECT * FROM messages WHERE created>=? AND text LIKE ? ORDER BY id ASC LIMIT 300',(cutoff if cutoff else 0,f'%{q.strip()}%')).fetchall()
+    else: rows=c.execute('SELECT * FROM messages WHERE created>=? ORDER BY id ASC LIMIT 300',(cutoff if cutoff else 0,)).fetchall()
+    out=[]
+    for r in rows:
+        reply=None
+        if r['reply_to_id']:
+            rr=c.execute('SELECT id,username,text FROM messages WHERE id=?',(r['reply_to_id'],)).fetchone()
+            if rr: reply={'id':rr['id'],'username':rr['username'],'text':rr['text']}
+        out.append({'id':r['id'],'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'reply_to':reply,'edited':bool(r['edited']),'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M'),'created':r['created']})
     c.close()
-    return {'locked':locked,'settings':{**settings,'disappearing_seconds':0},'messages':[{'id':r['id'],'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M'),'created':r['created']} for r in rows]}
+    return {'locked':locked,'settings':settings,'messages':out}
 
 @app.post('/api/community/messages')
 def post_message(req: Request, x: Msg):
     u,c,m=require_community_member(req); is_locked=get_locked(c)
     if is_locked and u['role']!='admin': c.close(); raise HTTPException(403,'Community chat is locked by the administrator.')
     if not x.text.strip() and not x.media_data: c.close(); raise HTTPException(400,'Message cannot be empty.')
+    reply_id=int(x.reply_to_id or 0)
+    if reply_id and not c.execute('SELECT 1 FROM messages WHERE id=?',(reply_id,)).fetchone(): reply_id=0
     now=int(time.time())
-    c.execute('INSERT INTO messages(username,pma_id,text,media_data,media_type,created) VALUES(?,?,?,?,?,?)',(u['username'],u['pma_id'],x.text,x.media_data,x.media_type,now))
+    c.execute('INSERT INTO messages(username,pma_id,text,media_data,media_type,reply_to_id,edited,created) VALUES(?,?,?,?,?,?,?,?)',(u['username'],u['pma_id'],x.text.strip(),x.media_data,x.media_type,reply_id,0,now))
     record_activity(c,u['id'],'community_post',10)
     users=c.execute('SELECT username FROM users WHERE username<>?',(u['username'],)).fetchall()
     for r in users: push_notice(c,r['username'],'New community message',f"{u['username']} posted in the community.",'community')
     c.commit(); c.close(); return {'ok':True}
 
 @app.delete('/api/community/messages/{message_id}')
-def delete_community_message(req: Request, message_id: int):
+def delete_message(req: Request, message_id: int):
     u,c,m=require_community_member(req)
-    row=c.execute('SELECT id,username FROM messages WHERE id=?',(message_id,)).fetchone()
+    row=c.execute('SELECT * FROM messages WHERE id=?',(message_id,)).fetchone()
     if not row: c.close(); raise HTTPException(404,'Message not found.')
-    if u['role']!='admin' and row['username']!=u['username']:
-        c.close(); raise HTTPException(403,'You can only delete your own messages.')
+    if row['username'] != u['username'] and u['role'] != 'admin': c.close(); raise HTTPException(403,'You can only delete your own message.')
     c.execute('DELETE FROM messages WHERE id=?',(message_id,)); c.commit(); c.close(); return {'ok':True}
+
+@app.post('/api/community/leave')
+def leave_community(req: Request):
+    u=current(req); c=db()
+    if u['role']=='admin': c.close(); raise HTTPException(400,'The administrator cannot leave the community.')
+    c.execute("UPDATE community_members SET status='removed',updated_at=?,note='Left the community voluntarily' WHERE user_id=?",(int(time.time()),u['id']))
+    c.commit(); c.close(); return {'ok':True,'status':'removed'}
 
 @app.get('/api/admin/community/members')
 def community_members(req: Request, status: str=''):
@@ -988,8 +957,8 @@ def moderate_community(req: Request, x: CommunityModeration):
 def update_community_settings(req: Request, x: CommunitySettings):
     u=current(req)
     if u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    seconds=0; name=x.name.strip()[:80] or 'PMA Community'; now=int(time.time())
-    c=db(); c.execute('UPDATE community_settings SET name=?,profile_picture=?,disappearing_seconds=?,updated_at=? WHERE id=1',(name,x.profile_picture,seconds,now)); c.commit(); out=community_settings_row(c); c.close(); return {'ok':True,'settings':out}
+    seconds=max(0,min(int(x.disappearing_seconds or 0),7*86400)); name=x.name.strip()[:80] or 'PMA Community'; bio=x.bio.strip()[:300] or 'A place for PMA members to learn, share and discuss the markets.'; now=int(time.time())
+    c=db(); c.execute('UPDATE community_settings SET name=?,bio=?,profile_picture=?,disappearing_seconds=?,updated_at=? WHERE id=1',(name,bio,x.profile_picture,seconds,now)); c.commit(); out=community_settings_row(c); c.close(); return {'ok':True,'settings':out}
 
 
 @app.post('/api/admin/community/toggle')
