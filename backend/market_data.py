@@ -13,8 +13,9 @@ YAHOO_MAP = {
     'SPX':'^GSPC','SP500':'^GSPC','SPX500':'^GSPC','NAS100':'^NDX','NDX':'^NDX','US30':'^DJI','DOW':'^DJI','DAX':'^GDAXI','GER40':'^GDAXI','FTSE100':'^FTSE','UK100':'^FTSE','NIKKEI':'^N225','JP225':'^N225','FRA40':'^FCHI',
     'BTCUSD':'BTC-USD','ETHUSD':'ETH-USD','XRPUSD':'XRP-USD','SOLUSD':'SOL-USD','BNBUSD':'BNB-USD','ADAUSD':'ADA-USD','LTCUSD':'LTC-USD'
 }
-INTERVALS = {'15m':'15m','30m':'30m','1h':'1h','1d':'1d'}
-RANGES_DAYS = {'15m':7,'30m':30,'1h':90,'1d':900}
+INTERVALS = {'1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'1h','1d':'1d'}
+RANGES_DAYS = {'1m':7,'5m':60,'15m':7,'30m':30,'1h':90,'1d':900}
+TIMEFRAME_MINUTES = {'1m':1,'5m':5,'15m':15,'30m':30,'1h':60,'4h':240,'1d':1440}
 CACHE = {}
 
 
@@ -65,7 +66,7 @@ def aggregate_4h(rows):
 
 def fetch(symbol: str, interval: str):
     symbol = norm_symbol(symbol)
-    if interval not in {'15m','30m','1h','4h','1d'}:
+    if interval not in {'1m','5m','15m','30m','1h','4h','1d'}:
         raise ValueError(f'Unsupported timeframe: {interval}')
     if interval == '4h':
         key = (symbol, interval)
@@ -243,8 +244,9 @@ def structure_label(rows):
     return 'Range / mixed structure'
 
 
-def analyze_setup(rows15, frames):
+def analyze_setup(rows15, frames, trigger_timeframe='15m'):
     t15 = trend_info(rows15)
+    tf_minutes = TIMEFRAME_MINUTES.get(trigger_timeframe, 15)
     last = rows15[-1]['close']
     a = atr(rows15)
     support = t15['support']
@@ -275,12 +277,12 @@ def analyze_setup(rows15, frames):
         zone_type = 'Demand / support'
         next_zone = resistance
         next_zone_type = 'Supply / resistance'
-        risk = max(last - (support - a * 0.5), a * 0.5)
-        stop_loss = support - a * 0.5
+        risk = max(last - stop_loss, a * 0.25)
+        stop_loss = support - a * 0.25
         tp1 = last + risk
         tp2 = last + risk * 2
         trigger_price = t15['trigger_high']
-        trigger_text = f'15m close above {trigger_price:.8f}'
+        trigger_text = f'{trigger_timeframe} close above {trigger_price:.8f}'
     elif direction == 'SELL':
         if t15['trend'] == 'Bearish': score += 20; reasons.append('15m trend is bearish')
         if bearish_count >= 3: score += 25; reasons.append('multiple timeframes support SELL')
@@ -290,12 +292,12 @@ def analyze_setup(rows15, frames):
         zone_type = 'Supply / resistance'
         next_zone = support
         next_zone_type = 'Demand / support'
-        stop_loss = resistance + a * 0.5
-        risk = max(stop_loss - last, a * 0.5)
+        stop_loss = resistance + a * 0.25
+        risk = max(stop_loss - last, a * 0.25)
         tp1 = last - risk
         tp2 = last - risk * 2
         trigger_price = t15['trigger_low']
-        trigger_text = f'15m close below {trigger_price:.8f}'
+        trigger_text = f'{trigger_timeframe} close below {trigger_price:.8f}'
     else:
         return {
             'direction':'NO TRADE', 'score':score, 'status':'MULTI-TF CONFLICT', 'reasons':['Timeframes are not sufficiently aligned'],
@@ -326,7 +328,7 @@ def analyze_setup(rows15, frames):
         'next_zone': next_zone,
         'next_zone_type': next_zone_type,
         'candles_to_next_zone': candles,
-        'estimated_minutes_to_next_zone': candles * 15,
+        'estimated_minutes_to_next_zone': candles * tf_minutes,
         'distance_to_next_zone': distance,
         'atr': a,
         'last': last,
