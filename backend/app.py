@@ -402,6 +402,15 @@ def _send_verification_email(email, code):
     raise RuntimeError('Email delivery is not configured. Set RESEND_API_KEY or SMTP_HOST/SMTP_USER/SMTP_PASSWORD on the backend.')
 
 
+def _email_provider_configured():
+    return bool(RESEND_API_KEY or (SMTP_HOST and SMTP_USER and SMTP_PASSWORD))
+
+def _email_provider_name():
+    if RESEND_API_KEY: return 'Resend'
+    if SMTP_HOST and SMTP_USER and SMTP_PASSWORD: return 'SMTP'
+    return 'Not configured'
+
+
 def _issue_verification(c, row):
     code=f'{secrets.randbelow(1000000):06d}'; expires=int(time.time())+EMAIL_VERIFY_TTL
     c.execute('UPDATE users SET verification_code_hash=?,verification_expires=?,verification_attempts=0 WHERE id=?',(_verification_hash(row['email'],code),expires,row['id']))
@@ -472,18 +481,38 @@ def signup(x: Signup):
     return {'user':user_out(row),'verification_required':True,'message':'Account created. Check your email for the 6-digit verification code.'}
 
 
+@app.get('/api/auth/email-status')
+def auth_email_status(req: Request):
+    # Safe diagnostic endpoint: exposes configuration state, never credentials.
+    return {'configured': _email_provider_configured(), 'provider': _email_provider_name(), 'from_configured': bool(EMAIL_FROM), 'verification_required_on_login': True}
+
+
 @app.post('/api/auth/login')
 def login(x: Login):
-    c = db(); row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(str(x.email),)).fetchone()
+    email=str(x.email).lower().strip()
+    c = db(); row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(email,)).fetchone()
     if not row or not verify_password(x.password,row['password']):
         c.close(); raise HTTPException(401,'Email or password is incorrect.')
-    # Require a fresh email verification code at each explicit login. This applies to members and administrators.
+
+    # If the configured administrator credentials match, repair the role on login
+    # instead of forcing the administrator to create a second account.
+    if ADMIN_PASSWORD and email == ADMIN_EMAIL and x.password == ADMIN_PASSWORD and row['role'] != 'admin':
+        c.execute('UPDATE users SET role=?,username=?,full_name=? WHERE id=?',(
+            'admin', ADMIN_USERNAME, ADMIN_FULL_NAME, row['id']))
+        c.commit(); row=c.execute('SELECT * FROM users WHERE id=?',(row['id'],)).fetchone()
+
+    # Every explicit login requires a fresh six-digit email verification code.
+    # Do not silently retry this operation: retrying would generate multiple codes
+    # and invalidate the previous one.
+    if not _email_provider_configured():
+        c.close()
+        raise HTTPException(503,'Email verification is not configured on the PMA server. Add RESEND_API_KEY (recommended) or SMTP_HOST, SMTP_USER and SMTP_PASSWORD in Render Environment Variables.')
     try:
         _issue_verification(c,row)
         c.commit(); c.close()
     except Exception as ex:
         c.rollback(); c.close()
-        raise HTTPException(503,'Email verification could not be sent. Configure RESEND_API_KEY or SMTP settings on the backend, then try again.')
+        raise HTTPException(503,f'PMA could not send the verification email. Check the email provider settings in Render. ({str(ex)})')
     raise HTTPException(403,'EMAIL_VERIFY_REQUIRED')
 
 

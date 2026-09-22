@@ -1,0 +1,34 @@
+PMA LOGIN / EMAIL VERIFICATION - REQUIRED RENDER SETTINGS
+
+The login flow now requires a fresh 6-digit email code on every explicit login, including the administrator.
+
+IMPORTANT: the application code cannot send email by itself. Render must have an email provider configured.
+
+RECOMMENDED: RESEND
+1. Create a Resend account and obtain an API key.
+2. In Render -> PMA backend service -> Environment, add:
+   RESEND_API_KEY = your_resend_api_key
+   PMA_EMAIL_FROM = onboarding@resend.dev   (for initial Resend testing if permitted for the recipient)
+3. Redeploy the backend.
+
+OR SMTP
+Add these Render environment variables:
+   SMTP_HOST
+   SMTP_PORT=587
+   SMTP_USER
+   SMTP_PASSWORD
+   SMTP_TLS=1
+   PMA_EMAIL_FROM=the_sender_address
+
+Also keep:
+   PMA_ADMIN_EMAIL=the existing admin email
+   PMA_ADMIN_PASSWORD=the existing admin password
+   PMA_ADMIN_USERNAME=the existing admin username
+   PMA_ADMIN_FULL_NAME=the existing admin full name
+   PMA_SECRET_KEY=a long random secret
+
+Do NOT put the email API key, SMTP password, or admin password in frontend files or GitHub.
+
+The login page now reports the actual provider/configuration problem instead of hiding it behind "Please try again in a moment."
+
+The frontend no longer retries /auth/login because retrying login would generate multiple verification codes and invalidate the previous one.
