@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import base64, hashlib, hmac, json
-import os, random, secrets, sqlite3, time
+import os, random, secrets, sqlite3, time, threading
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +19,8 @@ TOKEN_TTL = int(os.getenv('PMA_TOKEN_TTL', str(60*60*24*30)))
 QUALIFICATION_HOURS = int(os.getenv('PMA_REFERRAL_QUALIFICATION_HOURS', '48'))
 DB = os.getenv('PMA_DB', 'pma.db')
 sessions = {}
+_DB_INIT_LOCK = threading.Lock()
+_DB_READY = False
 
 app = FastAPI(title='Pips Master Academy API', version='2.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
@@ -135,108 +137,51 @@ def verify_password(password, stored_hash):
 
 
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    c.execute('''CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY, username TEXT UNIQUE, full_name TEXT, email TEXT UNIQUE,
-        password TEXT, pma_id TEXT UNIQUE, referral_code TEXT UNIQUE, referrer TEXT,
-        role TEXT DEFAULT 'user', phone TEXT DEFAULT '', dob TEXT DEFAULT '', profile_picture TEXT DEFAULT '',
-        created INTEGER, xp INTEGER DEFAULT 0, last_active INTEGER DEFAULT 0, login_count INTEGER DEFAULT 0,
-        activity_count INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS messages(
-        id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '',
-        media_type TEXT DEFAULT '', created INTEGER
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS community_members(
-        user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member',
-        warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0,
-        updated_at INTEGER DEFAULT 0, note TEXT DEFAULT ''
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS community_settings(
-        id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', profile_picture TEXT DEFAULT '',
-        disappearing_seconds INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS notifications(
-        id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0,
-        target_page TEXT DEFAULT '', target_ref TEXT DEFAULT ''
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS referrals(
-        id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, referred_id INTEGER NOT NULL,
-        challenge_month TEXT NOT NULL, status TEXT DEFAULT 'pending', created INTEGER NOT NULL,
-        qualification_due INTEGER NOT NULL, qualified_at INTEGER, flagged INTEGER DEFAULT 0,
-        reason TEXT DEFAULT '', UNIQUE(referrer_id,referred_id)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS lesson_progress(
-        user_id INTEGER NOT NULL, lesson_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
-        PRIMARY KEY(user_id,lesson_id)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS task_progress(
-        user_id INTEGER NOT NULL, task_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
-        PRIMARY KEY(user_id,task_id)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_task_progress(
-        user_id INTEGER NOT NULL, task_id TEXT NOT NULL, day TEXT NOT NULL, completed_at INTEGER NOT NULL,
-        PRIMARY KEY(user_id,task_id,day)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS feedback(
-        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, username TEXT NOT NULL, category TEXT NOT NULL,
-        rating INTEGER NOT NULL, message TEXT NOT NULL, created INTEGER NOT NULL, status TEXT DEFAULT 'new'
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS activity_log(
-        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, event_type TEXT NOT NULL, created INTEGER NOT NULL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS trade_history(
-        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, market TEXT NOT NULL, timeframe TEXT NOT NULL,
-        direction TEXT NOT NULL, entry REAL, stop_loss REAL, take_profit REAL, outcome TEXT NOT NULL, reason TEXT DEFAULT '',
-        opened_at INTEGER NOT NULL, closed_at INTEGER NOT NULL
-    )''')
-    # Small migrations for databases created by previous PMA versions.
-    notif_existing = {r['name'] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
-    for name, ddl in {
-        'target_page':'ALTER TABLE notifications ADD COLUMN target_page TEXT DEFAULT ''',
-        'target_ref':'ALTER TABLE notifications ADD COLUMN target_ref TEXT DEFAULT ''',
-    }.items():
-        if name not in notif_existing:
-            c.execute(ddl)
-
-    existing = {r['name'] for r in c.execute("PRAGMA table_info(users)").fetchall()}
-    for name, ddl in {
-        'xp':'ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0',
-        'last_active':'ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0',
-        'login_count':'ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0',
-        'activity_count':'ALTER TABLE users ADD COLUMN activity_count INTEGER DEFAULT 0',
-    }.items():
-        if name not in existing:
-            c.execute(ddl)
-
-    now_seed=int(time.time())
-    c.execute("INSERT OR IGNORE INTO community_settings(id,name,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','',0,?)",(now_seed,))
-    c.execute("INSERT OR IGNORE INTO community_members(user_id,status,role,joined_at,updated_at) SELECT id,'approved',CASE WHEN role='admin' THEN 'admin' ELSE 'member' END,?,? FROM users",(now_seed,now_seed))
-
-    # Keep notification history for 14 days only. Clearing the top-right inbox never deletes history.
-    c.execute('DELETE FROM notifications WHERE created < ?', (int(time.time()) - 14*86400,))
-
-    # If the admin password is configured in the deployment environment, make sure the
-    # designated admin account exists and can authenticate from any device. No password is
-    # stored in frontend code or source files.
-    if ADMIN_PASSWORD:
-        admin_row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)', (ADMIN_EMAIL,)).fetchone()
-        if admin_row:
-            c.execute('UPDATE users SET username=?,full_name=?,role=? WHERE id=?', (ADMIN_USERNAME, ADMIN_FULL_NAME, 'admin', admin_row['id']))
-            if not verify_password(ADMIN_PASSWORD, admin_row['password']):
-                c.execute('UPDATE users SET password=? WHERE id=?', (hash_password(ADMIN_PASSWORD), admin_row['id']))
-        else:
-            now = int(time.time())
-            pma = 'PMA-ADMIN001'
-            referral_code = 'PMAADMIN001'
-            c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                      (ADMIN_USERNAME, ADMIN_FULL_NAME, ADMIN_EMAIL, hash_password(ADMIN_PASSWORD), pma, referral_code, '', 'admin', now, 0, now, 0, 1))
-
-    c.commit()
+    global _DB_READY
+    c=sqlite3.connect(DB,timeout=8)
+    c.row_factory=sqlite3.Row
+    if not _DB_READY:
+        with _DB_INIT_LOCK:
+            if not _DB_READY:
+                c.executescript('''
+                CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, full_name TEXT, email TEXT UNIQUE, password TEXT, pma_id TEXT UNIQUE, referral_code TEXT UNIQUE, referrer TEXT, role TEXT DEFAULT 'user', phone TEXT DEFAULT '', dob TEXT DEFAULT '', profile_picture TEXT DEFAULT '', created INTEGER, xp INTEGER DEFAULT 0, last_active INTEGER DEFAULT 0, login_count INTEGER DEFAULT 0, activity_count INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '', media_type TEXT DEFAULT '', created INTEGER);
+                CREATE TABLE IF NOT EXISTS community_members(user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member', warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0, note TEXT DEFAULT '');
+                CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', profile_picture TEXT DEFAULT '', disappearing_seconds INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0, target_page TEXT DEFAULT '', target_ref TEXT DEFAULT '');
+                CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
+                CREATE TABLE IF NOT EXISTS referrals(id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, referred_id INTEGER NOT NULL, challenge_month TEXT NOT NULL, status TEXT DEFAULT 'pending', created INTEGER NOT NULL, qualification_due INTEGER NOT NULL, qualified_at INTEGER, flagged INTEGER DEFAULT 0, reason TEXT DEFAULT '', UNIQUE(referrer_id,referred_id));
+                CREATE TABLE IF NOT EXISTS lesson_progress(user_id INTEGER NOT NULL, lesson_id TEXT NOT NULL, completed_at INTEGER NOT NULL, PRIMARY KEY(user_id,lesson_id));
+                CREATE TABLE IF NOT EXISTS task_progress(user_id INTEGER NOT NULL, task_id TEXT NOT NULL, completed_at INTEGER NOT NULL, PRIMARY KEY(user_id,task_id));
+                CREATE TABLE IF NOT EXISTS daily_task_progress(user_id INTEGER NOT NULL, task_id TEXT NOT NULL, day TEXT NOT NULL, completed_at INTEGER NOT NULL, PRIMARY KEY(user_id,task_id,day));
+                CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, username TEXT NOT NULL, category TEXT NOT NULL, rating INTEGER NOT NULL, message TEXT NOT NULL, created INTEGER NOT NULL, status TEXT DEFAULT 'new');
+                CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, event_type TEXT NOT NULL, created INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS trade_history(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, market TEXT NOT NULL, timeframe TEXT NOT NULL, direction TEXT NOT NULL, entry REAL, stop_loss REAL, take_profit REAL, outcome TEXT NOT NULL, reason TEXT DEFAULT '', opened_at INTEGER NOT NULL, closed_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS signal_history(id INTEGER PRIMARY KEY, user_id INTEGER, symbol TEXT NOT NULL, market TEXT NOT NULL, timeframe TEXT NOT NULL, direction TEXT NOT NULL, status TEXT NOT NULL, setup_strength REAL, entry REAL, stop_loss REAL, take_profit REAL, reason TEXT DEFAULT '', event_key TEXT UNIQUE, created INTEGER NOT NULL);
+                ''')
+                notif_existing={r['name'] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
+                if 'target_page' not in notif_existing: c.execute("ALTER TABLE notifications ADD COLUMN target_page TEXT DEFAULT ''")
+                if 'target_ref' not in notif_existing: c.execute("ALTER TABLE notifications ADD COLUMN target_ref TEXT DEFAULT ''")
+                existing={r['name'] for r in c.execute("PRAGMA table_info(users)").fetchall()}
+                for name,ddl in {'xp':'ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0','last_active':'ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0','login_count':'ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0','activity_count':'ALTER TABLE users ADD COLUMN activity_count INTEGER DEFAULT 0'}.items():
+                    if name not in existing: c.execute(ddl)
+                now=int(time.time())
+                c.execute("INSERT OR IGNORE INTO community_settings(id,name,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','',0,?)",(now,))
+                c.execute("INSERT OR IGNORE INTO community_members(user_id,status,role,joined_at,updated_at) SELECT id,'approved',CASE WHEN role='admin' THEN 'admin' ELSE 'member' END,?,? FROM users",(now,now))
+                c.execute('DELETE FROM notifications WHERE created < ?',(now-14*86400,))
+                c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(username,created DESC)')
+                c.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_user_closed ON trade_history(user_id,closed_at DESC)')
+                c.execute('CREATE INDEX IF NOT EXISTS idx_referrals_referrer_status_month ON referrals(referrer_id,status,challenge_month)')
+                c.execute('CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created DESC)')
+                if ADMIN_PASSWORD:
+                    ar=c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(ADMIN_EMAIL,)).fetchone()
+                    if ar:
+                        c.execute('UPDATE users SET username=?,full_name=?,role=? WHERE id=?',(ADMIN_USERNAME,ADMIN_FULL_NAME,'admin',ar['id']))
+                        if not verify_password(ADMIN_PASSWORD,ar['password']): c.execute('UPDATE users SET password=? WHERE id=?',(hash_password(ADMIN_PASSWORD),ar['id']))
+                    else:
+                        c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(ADMIN_USERNAME,ADMIN_FULL_NAME,ADMIN_EMAIL,hash_password(ADMIN_PASSWORD),'PMA-ADMIN001','PMAADMIN001','', 'admin',now,0,now,0,1))
+                c.commit(); _DB_READY=True
     return c
-
 
 def month_key(ts=None):
     return datetime.fromtimestamp(ts or time.time(), timezone.utc).strftime('%Y-%m')
@@ -625,6 +570,15 @@ def market_data_test(symbol: str='EURUSD', timeframe: str='15m'):
         raise HTTPException(503,f'Market data test failed: {ex}')
 
 
+def _record_signal_event(setup, user_id=None):
+    try:
+        if not setup or setup.get('direction') in (None,'NO TRADE'): return
+        event_key='|'.join(str(setup.get(k,'')) for k in ('symbol','market','timeframe','direction','status','entry_zone','stop_loss','take_profit_1'))
+        reason=setup.get('day_trade_reason') or setup.get('reasons') or ''
+        if isinstance(reason,list): reason=' • '.join(str(x) for x in reason)
+        c=db(); c.execute('INSERT OR IGNORE INTO signal_history(user_id,symbol,market,timeframe,direction,status,setup_strength,entry,stop_loss,take_profit,reason,event_key,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(user_id,setup.get('symbol',''),setup.get('market',''),setup.get('timeframe',''),setup.get('direction',''),setup.get('status',''),setup.get('setup_strength'),setup.get('entry_zone'),setup.get('stop_loss'),setup.get('take_profit_1'),reason,event_key,int(time.time()))); c.commit(); c.close()
+    except Exception: pass
+
 @app.get('/api/signals/scan')
 def scan(market: str='Forex', symbols: str='', timeframe: str='15m'):
     if symbols.strip():
@@ -649,9 +603,9 @@ def scan(market: str='Forex', symbols: str='', timeframe: str='15m'):
     for sym in requested:
         try:
             if sym in batch:
-                opportunities.append(prepare_market_setup(sym,market,timeframe,batch[sym]))
+                setup=prepare_market_setup(sym,market,timeframe,batch[sym]); opportunities.append(setup); _record_signal_event(setup,None)
             else:
-                opportunities.append(prepare_market_setup(sym,market,timeframe))
+                setup=prepare_market_setup(sym,market,timeframe); opportunities.append(setup); _record_signal_event(setup,None)
         except Exception as ex:
             errors.append({'symbol':sym,'error':str(ex)})
     def rank_key(x):
@@ -751,6 +705,17 @@ def trade_monitor_history_add(req: Request, x: TradeHistoryEvent):
         (u['id'],x.symbol.upper(),x.market,x.timeframe,x.direction,x.entry,x.stop_loss,x.take_profit,x.outcome,x.reason,opened,now)); c.commit(); c.close()
     return {'ok':True}
 
+
+@app.get('/api/signal-history')
+def signal_history(req: Request, days: int = 7, limit: int = 200):
+    u=current(req); c=db(); cutoff=int(time.time())-max(1,min(days,30))*86400
+    rows=c.execute('SELECT * FROM signal_history WHERE (user_id=? OR user_id IS NULL) AND created>=? ORDER BY created DESC LIMIT ?', (u['id'],cutoff,max(1,min(limit,500)))).fetchall(); c.close()
+    return {'days':days,'signals':[dict(r) for r in rows]}
+
+@app.get('/api/feedback/summary')
+def feedback_summary(req: Request):
+    current(req); c=db(); row=c.execute('SELECT COUNT(*) n,COALESCE(AVG(rating),0) avg FROM feedback').fetchone(); dist=c.execute('SELECT rating,COUNT(*) n FROM feedback GROUP BY rating').fetchall(); c.close()
+    return {'count':int(row['n'] or 0),'average':round(float(row['avg'] or 0),2),'distribution':{str(r['rating']):int(r['n']) for r in dist}}
 
 @app.get('/api/referrals')
 def referrals(req: Request, month: str=''):
@@ -872,6 +837,8 @@ def community_member(c,user_id):
 
 def require_community_member(req):
     u=current(req); c=db(); m=community_member(c,u['id'])
+    if u['role']=='admin' and (not m or m['status']!='approved'):
+        now=int(time.time()); c.execute("INSERT OR REPLACE INTO community_members(user_id,status,role,warning_count,suspended_until,joined_at,updated_at,note) VALUES(?,?,?,?,?,?,?,?)",(u['id'],'approved','admin',m['warning_count'] if m else 0,0,m['joined_at'] if m else now,now,'Administrator access')); c.commit(); m=community_member(c,u['id'])
     if not m or m['status']!='approved':
         c.close(); raise HTTPException(403,'Community access is awaiting administrator approval.')
     if m['suspended_until'] and int(m['suspended_until'])>int(time.time()):
@@ -881,6 +848,8 @@ def require_community_member(req):
 @app.get('/api/community/status')
 def community_status(req: Request):
     u=current(req); c=db(); m=community_member(c,u['id']); settings=community_settings_row(c)
+    if u['role']=='admin' and (not m or m['status']!='approved'):
+        now=int(time.time()); c.execute("INSERT OR REPLACE INTO community_members(user_id,status,role,warning_count,suspended_until,joined_at,updated_at,note) VALUES(?,?,?,?,?,?,?,?)",(u['id'],'approved','admin',m['warning_count'] if m else 0,0,m['joined_at'] if m else now,now,'Administrator access')); c.commit(); m=community_member(c,u['id'])
     pending=bool(m and m['status']=='pending'); approved=bool(m and m['status']=='approved'); suspended=bool(m and m['status']=='suspended' and (m['suspended_until'] or 0)>int(time.time()))
     c.close(); return {'approved':approved,'pending':pending,'suspended':suspended,'status':m['status'] if m else 'pending','role':m['role'] if m else 'member','settings':settings}
 
