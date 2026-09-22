@@ -39,7 +39,7 @@
 const state={user:null,page:'home',market:'Forex',symbol:'EURUSD',ref:new URLSearchParams(location.search).get('ref')||'',notif:[],scannerTimer:null};
 const markets={Forex:['EURUSD','GBPUSD','USDJPY','GBPJPY','AUDUSD','USDCAD','USDCHF','NZDUSD','EURJPY','EURGBP','EURCHF','GBPCHF','AUDJPY','CADJPY'],Indices:['US30','NAS100','SPX500','GER40','UK100','FRA40','JP225'],Metals:['XAUUSD','XAGUSD','XPTUSD','XPDUSD'],Crypto:['BTCUSD','ETHUSD','SOLUSD','XRPUSD','LTCUSD'],Commodities:['USOIL','UKOIL','NATGAS','COPPER']};
 const TEMP_ADMIN={email:'ugoloevidence81@gmail.com',password:'PMA@Admin4827!',username:'PipsMaster',full_name:'Ugolo Evidence',role:'admin',pma_id:'PMA-ADMIN001',referral_code:'PMAADMIN001',profile_picture:''};
-const API_BASE=(localStorage.getItem('PMA_API_BASE')||'').replace(/\/$/,'');
+const API_BASE=(localStorage.getItem('PMA_API_BASE')||'https://pips-master-frontend.onrender.com').replace(/\/$/,'');
 function api(path,opts={}){const headers={'Content-Type':'application/json',...(opts.headers||{})};const token=localStorage.getItem('PMA_TOKEN');if(token)headers.Authorization='Bearer '+token;return fetch(API_BASE+'/api'+path,{...opts,headers}).then(async r=>{const x=await r.json().catch(()=>({}));if(!r.ok)throw Error(x.detail||'Request failed');return x})}
 function show(id){document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));document.getElementById(id).classList.add('active');if(id==='signup'&&state.ref){suMsg.textContent='Referral code: '+state.ref;suMsg.className='form-msg ok'}if(id==='app')page(state.page)}
 function togglePassword(id,btn){const el=document.getElementById(id);el.type=el.type==='password'?'text':'password';btn.textContent=el.type==='password'?'👁️':'🙈'}
