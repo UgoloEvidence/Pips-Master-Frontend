@@ -4,7 +4,7 @@ import os, random, secrets, sqlite3, time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from passlib.context import CryptContext
+import bcrypt
 from pydantic import BaseModel, EmailStr
 
 from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso
@@ -14,7 +14,6 @@ TOKEN_SECRET = os.getenv('PMA_SECRET_KEY', '') or 'pma-dev-secret-change-this-in
 TOKEN_TTL = int(os.getenv('PMA_TOKEN_TTL', str(60*60*24*30)))
 QUALIFICATION_HOURS = int(os.getenv('PMA_REFERRAL_QUALIFICATION_HOURS', '48'))
 DB = os.getenv('PMA_DB', 'pma.db')
-pwd = CryptContext(schemes=['bcrypt'], deprecated='auto')
 sessions = {}
 
 app = FastAPI(title='Pips Master Academy API', version='2.0')
@@ -69,7 +68,7 @@ DAILY_TASKS = [
     {'id':'daily-scanner-review','title':'Review one automated scanner setup','xp':20},
     {'id':'daily-community','title':'Make one useful community contribution','xp':20},
 ]
-REWARD_TIERS = [{'position':1,'required_referrals':100,'reward_usd':10},{'position':2,'required_referrals':80,'reward_usd':5},{'position':3,'required_referrals':60,'reward_usd':3}]
+REFERRAL_TARGETS = [{'position':1,'required_referrals':100},{'position':2,'required_referrals':80},{'position':3,'required_referrals':60}]
 
 
 class Signup(BaseModel):
@@ -106,6 +105,17 @@ class PasswordChange(BaseModel):
 
 class Completion(BaseModel):
     item_id: str
+
+
+def hash_password(password):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+
+def verify_password(password, stored_hash):
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8'))
+    except Exception:
+        return False
 
 
 def db():
@@ -184,6 +194,30 @@ def user_out(row):
         'pma_id': row['pma_id'], 'referral_code': row['referral_code'], 'role': row['role'],
         'phone': row['phone'] or '', 'dob': row['dob'] or '', 'profile_picture': row['profile_picture'] or '',
     }
+
+
+def referral_rank_for_count(count):
+    count = max(0, int(count or 0))
+    levels = [
+        ('Referral Newcomer', 0),
+        ('Referral Starter', 10),
+        ('Referral Builder', 25),
+        ('Referral Pro', 50),
+        ('Referral Champion', 80),
+        ('Referral Elite', 100),
+        ('Referral Legend', 250),
+    ]
+    current, current_min = levels[0]
+    next_name, next_min = None, None
+    for i, (name, threshold) in enumerate(levels):
+        if count >= threshold:
+            current, current_min = name, threshold
+            if i + 1 < len(levels):
+                next_name, next_min = levels[i + 1]
+        else:
+            break
+    progress = 100 if next_min is None else round(min(100, max(0, (count-current_min)/max(next_min-current_min,1)*100)), 1)
+    return {'referral_rank':current,'referral_rank_min':current_min,'next_referral_rank':next_name,'next_referral_count':next_min,'referral_rank_progress':progress}
 
 
 def rank_for_xp(xp):
@@ -330,7 +364,7 @@ def signup(x: Signup):
     now = int(time.time())
     referrer = resolve_referrer(c, x.referral)
     c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-              (x.username.strip(),x.full_name.strip(),str(x.email).lower(),pwd.hash(x.password),pma,pma.replace('-',''),referrer['username'] if referrer else '',role,now,0,now,0,1))
+              (x.username.strip(),x.full_name.strip(),str(x.email).lower(),hash_password(x.password),pma,pma.replace('-',''),referrer['username'] if referrer else '',role,now,0,now,0,1))
     uid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
     c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(uid,datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'signup',now))
     if referrer and referrer['id'] != uid:
@@ -347,7 +381,7 @@ def signup(x: Signup):
 @app.post('/api/auth/login')
 def login(x: Login):
     c = db(); row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(str(x.email),)).fetchone()
-    if not row or not pwd.verify(x.password,row['password']): c.close(); raise HTTPException(401,'Email or password is incorrect.')
+    if not row or not verify_password(x.password,row['password']): c.close(); raise HTTPException(401,'Email or password is incorrect.')
     now = int(time.time())
     c.execute('UPDATE users SET last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,row['id']))
     c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
@@ -372,7 +406,10 @@ def update_profile(req: Request, x: Profile):
     u=current(req); c=db()
     if c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?) AND id<>?',(x.username,u['id'])).fetchone():
         c.close(); raise HTTPException(400,'That username is already in use.')
-    c.execute('UPDATE users SET full_name=?,username=?,phone=?,dob=?,profile_picture=?,last_active=? WHERE id=?',(x.full_name.strip(),x.username.strip(),x.phone.strip(),x.dob,x.profile_picture or '',int(time.time()),u['id']))
+    old_username = u['username']
+    new_username = x.username.strip()
+    c.execute('UPDATE users SET full_name=?,username=?,phone=?,dob=?,profile_picture=?,last_active=? WHERE id=?',(x.full_name.strip(),new_username,x.phone.strip(),x.dob,x.profile_picture or '',int(time.time()),u['id']))
+    c.execute('UPDATE notifications SET username=? WHERE username=?',(new_username,old_username))
     c.execute('UPDATE referrals SET reason=reason WHERE referred_id=?',(u['id'],))
     push_notice(c,x.username.strip(),'Profile saved','Your profile changes were saved successfully.','account'); c.commit()
     row=c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone(); c.close(); return {'user':user_out(row)}
@@ -382,13 +419,27 @@ def update_profile(req: Request, x: Profile):
 def change_password(req: Request, x: PasswordChange):
     u=current(req)
     if len(x.password) < 8: raise HTTPException(400,'Password must be at least 8 characters.')
-    c=db(); c.execute('UPDATE users SET password=? WHERE id=?',(pwd.hash(x.password),u['id'])); push_notice(c,u['username'],'Password updated','Your password was updated successfully.','security'); c.commit(); c.close(); return {'ok':True}
+    c=db(); c.execute('UPDATE users SET password=? WHERE id=?',(hash_password(x.password),u['id'])); push_notice(c,u['username'],'Password updated','Your password was updated successfully.','security'); c.commit(); c.close(); return {'ok':True}
 
 
 @app.get('/api/notifications')
 def notifications(req: Request):
-    u=current(req); c=db(); rows=c.execute('SELECT * FROM notifications WHERE username=? ORDER BY id DESC LIMIT 60',(u['username'],)).fetchall(); c.close()
+    u=current(req); c=db(); rows=c.execute('SELECT * FROM notifications WHERE username=? ORDER BY id DESC LIMIT 200',(u['username'],)).fetchall(); c.close()
     return {'notifications':[{'id':r['id'],'title':r['title'],'text':r['text'],'type':r['type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'read':bool(r['read']),'target_page':r['target_page'] or notification_target(r['type']),'target_ref':r['target_ref'] or ''} for r in rows]}
+
+
+class NotificationRead(BaseModel):
+    notification_id: int
+
+
+@app.post('/api/notifications/read-one')
+def notifications_read_one(req: Request, x: NotificationRead):
+    u=current(req); c=db()
+    row=c.execute('SELECT id FROM notifications WHERE id=? AND username=?',(x.notification_id,u['username'])).fetchone()
+    if not row:
+        c.close(); raise HTTPException(404,'Notification not found.')
+    c.execute('UPDATE notifications SET read=1 WHERE id=? AND username=?',(x.notification_id,u['username']))
+    c.commit(); c.close(); return {'ok':True}
 
 
 @app.post('/api/notifications/read')
@@ -517,12 +568,15 @@ def referrals(req: Request, month: str=''):
     for idx,row in enumerate(leaderboard):
         if row['username']==u['username']: rank=idx+1; break
     c.commit(); c.close()
+    referral_rank = referral_rank_for_count(total)
     return {
         'month':mk,'qualified_total':total,'month_qualified':month_count,'pending':pending_count,
-        'position':rank if leaderboard else None,'challenge_rules':REWARD_TIERS,
+        'position':rank if leaderboard else None,'challenge_targets':REFERRAL_TARGETS,
+        **referral_rank,
         'monthly_leaderboard':[{'rank':i+1,'username':r['username'],'full_name':r['full_name'],'profile_picture':r['profile_picture'] or '','qualified':r['qualified']} for i,r in enumerate(leaderboard)],
         'history':[{'challenge_month':r['challenge_month'],'status':r['status'],'created':r['created'],'qualified_at':r['qualified_at']} for r in rows[:100]],
-        'qualification_policy':f'Referrals are recorded immediately as pending and reviewed automatically after about {QUALIFICATION_HOURS} hours plus basic account activity.'
+        'qualification_policy':f'Referrals are recorded immediately as pending and reviewed automatically after about {QUALIFICATION_HOURS} hours plus basic account activity.',
+        'rank_policy':'Qualified referrals contribute XP to your permanent academy rank and also increase your separate referral rank.'
     }
 
 
@@ -556,6 +610,7 @@ def progress(req: Request):
     referral_pct=round(min(100,lifetime_refs/250*100),1)
     consistency_pct=round(min(100,streak/30*100),1)
     overall=round(learning_pct*0.45+tasks_pct*0.25+referral_pct*0.20+consistency_pct*0.10,1)
+    referral_rank = referral_rank_for_count(lifetime_refs)
     c.close()
     return {
         'xp':user['xp'] or 0,**rank,'overall_progress':overall,'learning_progress':learning_pct,'tasks_progress':tasks_pct,
@@ -633,6 +688,15 @@ def toggle(req: Request):
     c.commit(); c.close(); return {'locked':new_state}
 
 
+@app.get('/api/admin/status')
+def admin_status(req: Request):
+    u=current(req)
+    if u['role']!='admin':
+        raise HTTPException(403,'Admin access required.')
+    c=db(); locked=get_locked(c); c.close()
+    return {'is_admin':True,'username':u['username'],'email':u['email'],'community_locked':locked}
+
+
 @app.get('/api/admin/stats')
 def admin_stats(req: Request):
     u=current(req)
@@ -645,4 +709,4 @@ def admin_stats(req: Request):
     locked=get_locked(c)
     feedback_count=c.execute("SELECT COUNT(*) n FROM feedback WHERE status='new'").fetchone()['n']
     c.commit(); c.close()
-    return {'total_users':total,'active_7d':active,'qualified_referrals':refs,'pending_referrals':pending,'feedback_new':feedback_count,'community_locked':locked,'monthly_reward_tiers':REWARD_TIERS,'rank_stages':['Beginner','Amateur','Professional','Expert','Master','Pips Master']}
+    return {'total_users':total,'active_7d':active,'qualified_referrals':refs,'pending_referrals':pending,'feedback_new':feedback_count,'community_locked':locked,'monthly_referral_targets':REFERRAL_TARGETS,'rank_stages':['Beginner','Amateur','Professional','Expert','Master','Pips Master']}
