@@ -167,6 +167,8 @@ def db():
                     if name not in existing: c.execute(ddl)
                 now=int(time.time())
                 c.execute("INSERT OR IGNORE INTO community_settings(id,name,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','',0,?)",(now,))
+                c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('community_locked','0')")
+                c.execute('CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created DESC)')
                 c.execute("INSERT OR IGNORE INTO community_members(user_id,status,role,joined_at,updated_at) SELECT id,'approved',CASE WHEN role='admin' THEN 'admin' ELSE 'member' END,?,? FROM users",(now,now))
                 c.execute('DELETE FROM notifications WHERE created < ?',(now-14*86400,))
                 c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(username,created DESC)')
@@ -645,6 +647,51 @@ def candles(symbol: str='EURUSD', timeframe: str='15m'):
         raise HTTPException(503,f'Live candle feed unavailable: {ex}')
 
 
+def prepare_yahoo_market_setup(symbol, market, trigger_timeframe='15m'):
+    """Fast verified fallback for non-Forex day-trade categories.
+    Fetches all required Yahoo frames in parallel, then runs the same PMA setup engine.
+    This avoids serial provider retries when TradingView has no row for an index/commodity.
+    """
+    trigger_timeframe = trigger_timeframe if trigger_timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m'
+    frame_names=('15m','30m','1h','4h','1d')
+    all_frames=tuple(dict.fromkeys(frame_names+(trigger_timeframe,)))
+    with ThreadPoolExecutor(max_workers=len(all_frames)) as pool:
+        jobs={pool.submit(fetch,symbol,tf):tf for tf in all_frames}
+        fetched={jobs[job]:job.result() for job in as_completed(jobs)}
+    frames={tf:fetched[tf] for tf in frame_names}
+    trigger_rows=fetched[trigger_timeframe]
+    setup=analyze_setup(trigger_rows,frames,trigger_timeframe)
+    trends={tf:trend_info(frames[tf]) for tf in frames}
+    validation=backtest(trigger_rows)
+    psize=pip_size(symbol)
+    return {
+        'symbol':symbol.upper(),'market':market,'direction':setup['direction'],'setup_strength':setup['score'],'status':setup['status'],
+        'entry_zone':round(setup['entry_zone'],8) if setup['entry_zone'] is not None else None,
+        'entry_note':'Use the zone as a planning area, not an exact guaranteed fill.',
+        'stop_loss':round(setup['stop_loss'],8) if setup['stop_loss'] is not None else None,
+        'take_profit_1':round(setup['take_profit_1'],8) if setup['take_profit_1'] is not None else None,
+        'take_profit_2':round(setup['take_profit_2'],8) if setup['take_profit_2'] is not None else None,
+        'risk_reward':'1:1 / 1:2 target framework' if setup['direction']!='NO TRADE' else '—',
+        'zone_type':setup.get('next_zone_type'),'next_zone':round(setup['next_zone'],8) if setup['next_zone'] is not None else None,
+        'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,
+        'distance_to_entry_zone':round(abs(setup['entry_zone']-setup['last']),8) if setup['entry_zone'] is not None else None,
+        'pips_to_entry_zone':round(abs(setup['entry_zone']-setup['last'])/psize,1) if setup['entry_zone'] is not None else None,
+        'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
+        'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),
+        'timeframe':trigger_timeframe,'atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),
+        'support':round(setup['support'],8) if setup['support'] is not None else None,
+        'resistance':round(setup['resistance'],8) if setup['resistance'] is not None else None,
+        'rsi_trigger':setup['rsi'],'structure':setup['structure'],
+        'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,
+        'next_signal_status':'TRIGGERED' if setup['status']=='SIGNAL READY' else 'WAITING FOR CONFIRMATION',
+        'trade_state':'ACTIVE' if setup['status']=='SIGNAL READY' else setup['status'],
+        'next_signal_trigger':setup['trigger_text'],'reasons':setup['reasons'],
+        'trends':{tf:trends[tf]['trend'] for tf in trends},'trend_detail':trends,
+        'trend_alignment':f"{sum(1 for v in trends.values() if v['trend']==setup['trend'])}/5" if setup['trend']!='Neutral' else '0/5',
+        'validation':validation,'data_source':'Verified Yahoo Finance chart feed','updated_at':utc_iso(),
+        'method':'PMA confluence engine: verified Yahoo candles + trend + RSI + structure + MTF alignment + ATR zone projection'
+    }
+
 @app.get('/api/day-trade/plan')
 def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJPY,XAUUSD,BTCUSD', timeframe: str='15m'):
     requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:8]
@@ -655,7 +702,13 @@ def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJP
     try: batch=_tv_scan_many(requested,market,tfs)
     except Exception as ex: errors.append({'scope':'batch','error':str(ex)})
     def build(sym):
-        setup=prepare_market_setup(sym,market,timeframe,batch.get(sym))
+        # Forex/Crypto keep the fast TradingView batch path. Indices/Metals/Commodities
+        # use the verified Yahoo candle engine directly so a missing TradingView row
+        # cannot force a slow chain of provider retries.
+        if market in ('Metals','Commodities','Indices') and sym not in batch:
+            setup=prepare_yahoo_market_setup(sym,market,timeframe)
+        else:
+            setup=prepare_market_setup(sym,market,timeframe,batch.get(sym))
         context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
         setup['day_trade_state']='READY' if context_ok and setup['status']=='SIGNAL READY' else ('FORECAST' if setup['direction']!='NO TRADE' else setup['status'])
         setup['day_trade_reason']=f"{timeframe} forecast is aligned with 1H and 4H context." if context_ok else 'Trend is context only. Wait for the planned pullback, sniper candle confirmation and risk trigger before entering.'
@@ -711,6 +764,19 @@ def signal_history(req: Request, days: int = 7, limit: int = 200):
     u=current(req); c=db(); cutoff=int(time.time())-max(1,min(days,30))*86400
     rows=c.execute('SELECT * FROM signal_history WHERE (user_id=? OR user_id IS NULL) AND created>=? ORDER BY created DESC LIMIT ?', (u['id'],cutoff,max(1,min(limit,500)))).fetchall(); c.close()
     return {'days':days,'signals':[dict(r) for r in rows]}
+
+@app.get('/api/history')
+def unified_history(req: Request, history_type: str='all', days: int=7, limit: int=200):
+    u=current(req); days=max(1,min(int(days or 7),30)); limit=max(1,min(int(limit or 200),500)); cutoff=int(time.time())-days*86400
+    c=db(); items=[]
+    if history_type in ('all','day-trade','trade'):
+        rows=c.execute('SELECT * FROM trade_history WHERE user_id=? AND closed_at>=? ORDER BY closed_at DESC LIMIT ?', (u['id'],cutoff,limit)).fetchall()
+        for r in rows: items.append({'type':'day-trade','id':r['id'],'symbol':r['symbol'],'market':r['market'],'timeframe':r['timeframe'],'direction':r['direction'],'status':r['outcome'],'strength':None,'entry':r['entry'],'stop_loss':r['stop_loss'],'take_profit':r['take_profit'],'reason':r['reason'],'created':r['closed_at']})
+    if history_type in ('all','signals','scanner'):
+        rows=c.execute('SELECT * FROM signal_history WHERE (user_id=? OR user_id IS NULL) AND created>=? ORDER BY created DESC LIMIT ?', (u['id'],cutoff,limit)).fetchall()
+        for r in rows: items.append({'type':'scanner','id':r['id'],'symbol':r['symbol'],'market':r['market'],'timeframe':r['timeframe'],'direction':r['direction'],'status':r['status'],'strength':r['setup_strength'],'entry':r['entry'],'stop_loss':r['stop_loss'],'take_profit':r['take_profit'],'reason':r['reason'],'created':r['created']})
+    c.close(); items.sort(key=lambda x:x['created'],reverse=True)
+    return {'days':days,'history_type':history_type,'items':items[:limit]}
 
 @app.get('/api/feedback/summary')
 def feedback_summary(req: Request):
@@ -866,11 +932,9 @@ def community_join(req: Request, x: CommunityRequest):
 def get_messages(req: Request, q: str=''):
     u,c,m=require_community_member(req); locked=get_locked(c); settings=community_settings_row(c)
     if q.strip(): rows=c.execute('SELECT * FROM messages WHERE text LIKE ? ORDER BY id ASC LIMIT 300',(f'%{q.strip()}%',)).fetchall()
-    else: rows=c.execute('SELECT * FROM messages ORDER BY id ASC LIMIT 300').fetchall()
-    cutoff=int(time.time())-int(settings['disappearing_seconds'] or 0) if settings['disappearing_seconds'] else 0
-    if cutoff: c.execute('DELETE FROM messages WHERE created<?',(cutoff,)); c.commit()
+    else: rows=list(reversed(c.execute('SELECT * FROM messages ORDER BY id DESC LIMIT 300').fetchall()))
     c.close()
-    return {'locked':locked,'settings':settings,'messages':[{'id':r['id'],'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M'),'created':r['created']} for r in rows if not cutoff or r['created']>=cutoff]}
+    return {'locked':locked,'settings':{**settings,'disappearing_seconds':0},'messages':[{'id':r['id'],'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M'),'created':r['created']} for r in rows]}
 
 @app.post('/api/community/messages')
 def post_message(req: Request, x: Msg):
@@ -883,6 +947,15 @@ def post_message(req: Request, x: Msg):
     users=c.execute('SELECT username FROM users WHERE username<>?',(u['username'],)).fetchall()
     for r in users: push_notice(c,r['username'],'New community message',f"{u['username']} posted in the community.",'community')
     c.commit(); c.close(); return {'ok':True}
+
+@app.delete('/api/community/messages/{message_id}')
+def delete_community_message(req: Request, message_id: int):
+    u,c,m=require_community_member(req)
+    row=c.execute('SELECT id,username FROM messages WHERE id=?',(message_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404,'Message not found.')
+    if u['role']!='admin' and row['username']!=u['username']:
+        c.close(); raise HTTPException(403,'You can only delete your own messages.')
+    c.execute('DELETE FROM messages WHERE id=?',(message_id,)); c.commit(); c.close(); return {'ok':True}
 
 @app.get('/api/admin/community/members')
 def community_members(req: Request, status: str=''):
@@ -915,7 +988,7 @@ def moderate_community(req: Request, x: CommunityModeration):
 def update_community_settings(req: Request, x: CommunitySettings):
     u=current(req)
     if u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    seconds=max(0,min(int(x.disappearing_seconds or 0),7*86400)); name=x.name.strip()[:80] or 'PMA Community'; now=int(time.time())
+    seconds=0; name=x.name.strip()[:80] or 'PMA Community'; now=int(time.time())
     c=db(); c.execute('UPDATE community_settings SET name=?,profile_picture=?,disappearing_seconds=?,updated_at=? WHERE id=1',(name,x.profile_picture,seconds,now)); c.commit(); out=community_settings_row(c); c.close(); return {'ok':True,'settings':out}
 
 
