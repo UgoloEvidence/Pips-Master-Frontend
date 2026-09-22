@@ -1,17 +1,23 @@
-PMA UPDATE — MULTI-STRATEGY SNIPER + FAST MONITOR + TRADE HISTORY
+PMA UPDATE — LOGIN, MARKET SPEED, COMMUNITY, TRADING HISTORY
 
-Added:
-- Sniper confirmation layer: supply/demand rejection is not enough; verified historical trigger candles can require bullish/bearish engulfing before SIGNAL READY.
-- Strategy framework for Supply/Demand, Order Blocks / IOF retest context, Fair Value Gaps, Premium/Discount, Liquidity Sweeps, MSS/CHoCH, Wyckoff spring/upthrust context, VSA volume confirmation and Breakout/Retest architecture.
-- Day Trade cards show READY TO BUY / READY TO SELL, floating profit/loss, and strategy confluence.
-- Trade monitor history for the last 7 days with take-profit, stop-loss, manual-close and close-in-profit counts.
-- Notifications when a confirmed trade reaches TP/SL or when confirmation weakens while a trade is favorable.
-- Cached-first Day Trade and scanner loading with short live request timeout and background prefetch to reduce market/category/timeframe switching delays.
-- About Us moved directly under Calculator in the side navigation.
-- Scroll-in reveal animations across sections/cards with different left/right/bottom directions.
-- Existing 70–80 confirmed setup strength rule remains. Below 70 stays waiting for confirmation.
+This build updates the existing Pips Master Academy project.
+
+Main fixes:
+- Login no longer displays "Connecting to PMA".
+- Login timeout is more tolerant of backend wake-up time.
+- Multiple devices remain independently logged in; one device does not invalidate another.
+- Scanner requests the selected symbol first so switching timeframe/symbol can render the MTF context without waiting for an 8-symbol batch.
+- Backend market-data request/cache timing was increased to avoid premature frontend timeouts.
+- Day Trade keeps cached verified snapshots and prefetches other market categories in the background.
+- Indices, Metals, Crypto and Commodities use the same verified TradingView/Yahoo fallback path; no fake prices are generated.
+- Added full Trading History section to the hamburger menu.
+- Trading History reads backend trade_history and signal_history data.
+- History retention defaults to 7 days and the administrator can turn automatic 7-day deletion off/on.
+- Community shows member list, community bio, reply-to messages, media, member/admin delete controls, and 7-day disappearing-message setting.
+- Administrator cannot leave the community.
+- Regular approved members can leave the community; unapproved members can request access.
+- Admin can approve/remove/suspend/restore members and change community name, bio, picture and disappearing-message setting.
 
 Important:
-- External market-data providers can still be slower on a cold first request. The UI now shows the last verified cache immediately and refreshes in the background.
-- The percentage is setup-strength/confluence, not a win-rate probability or guarantee.
-- Real broker order execution is not included; trade history records PMA monitor outcomes/manual closes.
+- This package does not invent market prices or historical trades.
+- Full live provider speed still depends on TradingView/Yahoo and Render response time. The app now caches verified results and avoids failing the UI too early.

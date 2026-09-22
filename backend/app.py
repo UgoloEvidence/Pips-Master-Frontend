@@ -173,6 +173,7 @@ def db():
                 for name,ddl in {'xp':'ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0','last_active':'ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0','login_count':'ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0','activity_count':'ALTER TABLE users ADD COLUMN activity_count INTEGER DEFAULT 0'}.items():
                     if name not in existing: c.execute(ddl)
                 now=int(time.time())
+                c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('history_retention_enabled','1')")
                 c.execute("INSERT OR IGNORE INTO community_settings(id,name,bio,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','A place for PMA members to learn, share and discuss the markets.','',604800,?)",(now,))
                 if c.execute("SELECT 1 FROM settings WHERE key='community_default_retention_v1'").fetchone() is None:
                     c.execute("UPDATE community_settings SET disappearing_seconds=604800 WHERE id=1 AND COALESCE(disappearing_seconds,0)=0")
@@ -183,6 +184,8 @@ def db():
                 c.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_user_closed ON trade_history(user_id,closed_at DESC)')
                 c.execute('CREATE INDEX IF NOT EXISTS idx_referrals_referrer_status_month ON referrals(referrer_id,status,challenge_month)')
                 c.execute('CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created DESC)')
+                c.execute('CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created DESC)')
+                c.execute('CREATE INDEX IF NOT EXISTS idx_signal_history_user_created ON signal_history(user_id,created DESC)')
                 if ADMIN_PASSWORD:
                     ar=c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(ADMIN_EMAIL,)).fetchone()
                     if ar:
@@ -837,6 +840,31 @@ def complete_task(req: Request, x: Completion):
         push_notice(c,u['username'],'Task completed',f"You completed: {task['title']}.",'task')
     c.commit(); c.close(); return {'ok':True,'new_completion':not bool(exists),'item':task}
 
+
+def history_retention_enabled(c):
+    r=c.execute("SELECT value FROM settings WHERE key='history_retention_enabled'").fetchone()
+    return str(r['value'])!='0' if r else True
+
+@app.get('/api/history/settings')
+def history_settings(req: Request):
+    u=current(req); c=db(); enabled=history_retention_enabled(c); c.close(); return {'enabled':enabled,'days':7}
+
+@app.post('/api/history/settings')
+def history_settings_update(req: Request, x: dict):
+    u=current(req)
+    if u['role']!='admin': raise HTTPException(403,'Admin access required.')
+    enabled=bool(x.get('enabled',True)); c=db(); c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('history_retention_enabled',?)",('1' if enabled else '0',)); c.commit(); c.close(); return {'ok':True,'enabled':enabled,'days':7}
+
+@app.get('/api/history')
+def history_all(req: Request, days: int=7):
+    u=current(req); c=db(); enabled=history_retention_enabled(c); now=int(time.time()); cutoff=now-7*86400
+    if enabled:
+        c.execute('DELETE FROM trade_history WHERE closed_at<?',(cutoff,))
+        c.execute('DELETE FROM signal_history WHERE created<? AND (user_id=? OR user_id IS NULL)',(cutoff,u['id']))
+        c.commit()
+    rows=c.execute('SELECT * FROM trade_history WHERE user_id=? ORDER BY closed_at DESC LIMIT 300',(u['id'],)).fetchall()
+    sig=c.execute('SELECT * FROM signal_history WHERE (user_id=? OR user_id IS NULL) ORDER BY created DESC LIMIT 300',(u['id'],)).fetchall()
+    c.close(); return {'enabled':enabled,'days':7,'trades':[dict(r) for r in rows],'signals':[dict(r) for r in sig]}
 
 def community_settings_row(c):
     r=c.execute('SELECT * FROM community_settings WHERE id=1').fetchone()
