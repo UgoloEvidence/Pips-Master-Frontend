@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import base64, hashlib, hmac, json
 import os, random, secrets, sqlite3, time
 
 from fastapi import FastAPI, HTTPException, Request
@@ -8,7 +9,9 @@ from pydantic import BaseModel, EmailStr
 
 from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso
 
-ADMIN_EMAIL = 'ugoloevidence81@gmail.com'
+ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').lower()
+TOKEN_SECRET = os.getenv('PMA_SECRET_KEY', '') or 'pma-dev-secret-change-this-in-render'
+TOKEN_TTL = int(os.getenv('PMA_TOKEN_TTL', str(60*60*24*30)))
 QUALIFICATION_HOURS = int(os.getenv('PMA_REFERRAL_QUALIFICATION_HOURS', '48'))
 DB = os.getenv('PMA_DB', 'pma.db')
 pwd = CryptContext(schemes=['bcrypt'], deprecated='auto')
@@ -57,6 +60,14 @@ TASKS = [
     {'id':'task-challenge','title':'Complete a monthly learning challenge','xp':150},
     {'id':'task-consistency','title':'Maintain a learning routine','xp':100},
     {'id':'task-advanced','title':'Complete an advanced lesson','xp':200},
+]
+DAILY_TASKS = [
+    {'id':'daily-review-timeframes','title':'Review today’s 15m, 30m, 1H, 4H and 1D trends','xp':20},
+    {'id':'daily-lesson','title':'Complete one learning lesson','xp':30},
+    {'id':'daily-calculator','title':'Use one calculator tool with a practice example','xp':20},
+    {'id':'daily-journal','title':'Write one learning or trade-plan note','xp':25},
+    {'id':'daily-scanner-review','title':'Review one automated scanner setup','xp':20},
+    {'id':'daily-community','title':'Make one useful community contribution','xp':20},
 ]
 REWARD_TIERS = [{'position':1,'required_referrals':100,'reward_usd':10},{'position':2,'required_referrals':80,'reward_usd':5},{'position':3,'required_referrals':60,'reward_usd':3}]
 
@@ -112,7 +123,8 @@ def db():
         media_type TEXT DEFAULT '', created INTEGER
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS notifications(
-        id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0
+        id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0,
+        target_page TEXT DEFAULT '', target_ref TEXT DEFAULT ''
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS referrals(
@@ -129,10 +141,26 @@ def db():
         user_id INTEGER NOT NULL, task_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
         PRIMARY KEY(user_id,task_id)
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_task_progress(
+        user_id INTEGER NOT NULL, task_id TEXT NOT NULL, day TEXT NOT NULL, completed_at INTEGER NOT NULL,
+        PRIMARY KEY(user_id,task_id,day)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS feedback(
+        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, username TEXT NOT NULL, category TEXT NOT NULL,
+        rating INTEGER NOT NULL, message TEXT NOT NULL, created INTEGER NOT NULL, status TEXT DEFAULT 'new'
+    )''')
     c.execute('''CREATE TABLE IF NOT EXISTS activity_log(
         id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, event_type TEXT NOT NULL, created INTEGER NOT NULL
     )''')
     # Small migrations for databases created by previous PMA versions.
+    notif_existing = {r['name'] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
+    for name, ddl in {
+        'target_page':'ALTER TABLE notifications ADD COLUMN target_page TEXT DEFAULT ''',
+        'target_ref':'ALTER TABLE notifications ADD COLUMN target_ref TEXT DEFAULT ''',
+    }.items():
+        if name not in notif_existing:
+            c.execute(ddl)
+
     existing = {r['name'] for r in c.execute("PRAGMA table_info(users)").fetchall()}
     for name, ddl in {
         'xp':'ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0',
@@ -199,8 +227,42 @@ def daily_streak(c, user_id):
     return streak
 
 
-def push_notice(c, username, title, text, typ='info'):
-    c.execute('INSERT INTO notifications(username,title,text,type,created,read) VALUES(?,?,?,?,?,0)', (username,title,text,typ,int(time.time())))
+def _token_pack(payload):
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(',', ':')).encode()).decode().rstrip('=')
+    sig = hmac.new(TOKEN_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
+    return body + '.' + sig
+
+
+def _token_unpack(token):
+    try:
+        body, sig = token.split('.', 1)
+        expected = hmac.new(TOKEN_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        raw = base64.urlsafe_b64decode(body + '=' * (-len(body) % 4))
+        payload = json.loads(raw.decode())
+        if int(payload.get('exp', 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def make_token(user_id):
+    return _token_pack({'uid': int(user_id), 'exp': int(time.time()) + TOKEN_TTL})
+
+
+def notification_target(typ):
+    return {
+        'referral':'referrals', 'community':'community', 'task':'progress',
+        'signal':'signals', 'account':'profile', 'security':'profile', 'learning':'progress', 'feedback':'feedback'
+    }.get(typ, 'home')
+
+
+def push_notice(c, username, title, text, typ='info', target_page=''):
+    page = target_page or notification_target(typ)
+    c.execute('INSERT INTO notifications(username,title,text,type,created,read,target_page,target_ref) VALUES(?,?,?,?,?,?,?,?)',
+              (username,title,text,typ,int(time.time()),0,page,''))
 
 
 def get_locked(c):
@@ -214,15 +276,15 @@ def set_locked(c, value):
 
 def current(req: Request):
     token = req.headers.get('Authorization','').replace('Bearer ','').strip()
-    uid = sessions.get(token)
-    if not uid:
-        raise HTTPException(401,'Please log in.')
+    payload = _token_unpack(token)
+    if not payload:
+        raise HTTPException(401,'Please log in again.')
+    uid = payload.get('uid')
     c = db(); row = c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
     if not row:
         c.close(); raise HTTPException(401,'Session expired.')
-    now = int(time.time())
-    c.execute('UPDATE users SET last_active=?,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,uid))
-    c.commit(); c.close()
+    # Update presence only; do not inflate activity_count just because the UI polls the API.
+    c.execute('UPDATE users SET last_active=? WHERE id=?',(int(time.time()),uid)); c.commit(); c.close()
     return row
 
 
@@ -278,7 +340,7 @@ def signup(x: Signup):
     row = c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
     push_notice(c,row['username'],'Welcome to Pips Master Academy','Your account was created successfully.','account')
     c.commit(); c.close()
-    token = secrets.token_urlsafe(32); sessions[token] = uid
+    token = make_token(uid)
     return {'user':user_out(row),'token':token}
 
 
@@ -290,13 +352,13 @@ def login(x: Login):
     c.execute('UPDATE users SET last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,row['id']))
     c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
     push_notice(c,row['username'],'New login','Your account was signed in successfully.','security'); c.commit(); c.close()
-    token=secrets.token_urlsafe(32); sessions[token]=row['id']
+    token=make_token(row['id'])
     return {'user':user_out(row),'token':token}
 
 
 @app.post('/api/auth/logout')
 def logout(req: Request):
-    sessions.pop(req.headers.get('Authorization','').replace('Bearer ','').strip(), None)
+    # Tokens are signed and expire automatically; logout is handled client-side.
     return {'ok':True}
 
 
@@ -326,12 +388,41 @@ def change_password(req: Request, x: PasswordChange):
 @app.get('/api/notifications')
 def notifications(req: Request):
     u=current(req); c=db(); rows=c.execute('SELECT * FROM notifications WHERE username=? ORDER BY id DESC LIMIT 60',(u['username'],)).fetchall(); c.close()
-    return {'notifications':[{'id':r['id'],'title':r['title'],'text':r['text'],'type':r['type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'read':bool(r['read'])} for r in rows]}
+    return {'notifications':[{'id':r['id'],'title':r['title'],'text':r['text'],'type':r['type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'read':bool(r['read']),'target_page':r['target_page'] or notification_target(r['type']),'target_ref':r['target_ref'] or ''} for r in rows]}
 
 
 @app.post('/api/notifications/read')
 def notifications_read(req: Request):
     u=current(req); c=db(); c.execute('UPDATE notifications SET read=1 WHERE username=?',(u['username'],)); c.commit(); c.close(); return {'ok':True}
+
+
+class Feedback(BaseModel):
+    category: str = 'General'
+    rating: int = 5
+    message: str
+
+
+@app.post('/api/feedback')
+def submit_feedback(req: Request, x: Feedback):
+    u=current(req)
+    message=x.message.strip()
+    if not message:
+        raise HTTPException(400,'Please write your feedback before sending.')
+    rating=max(1,min(5,int(x.rating)))
+    category=(x.category or 'General').strip()[:40]
+    c=db(); now=int(time.time())
+    c.execute('INSERT INTO feedback(user_id,username,category,rating,message,created,status) VALUES(?,?,?,?,?,?,?)',
+              (u['id'],u['username'],category,rating,message,now,'new'))
+    record_activity(c,u['id'],'feedback_submit',0)
+    push_notice(c,u['username'],'Feedback received','Thanks — your feedback was saved to your PMA account.','feedback')
+    c.commit(); c.close()
+    return {'ok':True}
+
+
+@app.get('/api/feedback')
+def my_feedback(req: Request):
+    u=current(req); c=db(); rows=c.execute('SELECT category,rating,message,created,status FROM feedback WHERE user_id=? ORDER BY id DESC LIMIT 20',(u['id'],)).fetchall(); c.close()
+    return {'feedback':[{'category':r['category'],'rating':r['rating'],'message':r['message'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'status':r['status']} for r in rows]}
 
 
 def prepare_market_setup(symbol, market):
@@ -454,6 +545,8 @@ def progress(req: Request):
     user=c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone()
     completed_lessons=c.execute('SELECT lesson_id FROM lesson_progress WHERE user_id=?',(u['id'],)).fetchall()
     completed_tasks=c.execute('SELECT task_id FROM task_progress WHERE user_id=?',(u['id'],)).fetchall()
+    today=datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    completed_daily=c.execute('SELECT task_id FROM daily_task_progress WHERE user_id=? AND day=?',(u['id'],today)).fetchall()
     lifetime_refs=c.execute("SELECT COUNT(*) AS n FROM referrals WHERE referrer_id=? AND status='qualified'",(u['id'],)).fetchone()['n']
     monthly_refs=c.execute("SELECT COUNT(*) AS n FROM referrals WHERE referrer_id=? AND status='qualified' AND challenge_month=?",(u['id'],month_key())).fetchone()['n']
     streak=daily_streak(c,u['id'])
@@ -467,10 +560,10 @@ def progress(req: Request):
     return {
         'xp':user['xp'] or 0,**rank,'overall_progress':overall,'learning_progress':learning_pct,'tasks_progress':tasks_pct,
         'referral_progress':referral_pct,'consistency_progress':consistency_pct,'streak':streak,
-        'completed_lessons':len(completed_lessons),'total_lessons':len(LESSONS),'completed_tasks':len(completed_tasks),'total_tasks':len(TASKS),
+        'completed_lessons':len(completed_lessons),'total_lessons':len(LESSONS),'completed_tasks':len(completed_tasks),'total_tasks':len(TASKS),'completed_daily_tasks':len(completed_daily),'total_daily_tasks':len(DAILY_TASKS),
         'qualified_referrals_lifetime':lifetime_refs,'qualified_referrals_this_month':monthly_refs,
         'levels_are_long_term':True,'rank_factors':['qualified referrals','completed tasks','learning progress','overall progress/consistency'],
-        'lessons':LESSONS,'tasks':TASKS,
+        'lessons':LESSONS,'tasks':TASKS,'daily_tasks':DAILY_TASKS,'completed_daily_task_ids':[r['task_id'] for r in completed_daily],
     }
 
 
@@ -484,6 +577,19 @@ def complete_lesson(req: Request, x: Completion):
         record_activity(c,u['id'],'lesson_complete',lesson['xp'])
         push_notice(c,u['username'],'Lesson completed',f"You completed: {lesson['title']}.",'learning')
     c.commit(); c.close(); return {'ok':True,'new_completion':not bool(exists),'item':lesson}
+
+
+@app.post('/api/progress/daily-task')
+def complete_daily_task(req: Request, x: Completion):
+    u=current(req); task=next((i for i in DAILY_TASKS if i['id']==x.item_id),None)
+    if not task: raise HTTPException(404,'Daily task not found.')
+    day=datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    c=db(); exists=c.execute('SELECT 1 FROM daily_task_progress WHERE user_id=? AND task_id=? AND day=?',(u['id'],x.item_id,day)).fetchone()
+    if not exists:
+        c.execute('INSERT INTO daily_task_progress(user_id,task_id,day,completed_at) VALUES(?,?,?,?)',(u['id'],x.item_id,day,int(time.time())))
+        record_activity(c,u['id'],'daily_task_complete',task['xp'])
+        push_notice(c,u['username'],'Daily task completed',f"You completed: {task['title']}.",'task')
+    c.commit(); c.close(); return {'ok':True,'new_completion':not bool(exists),'item':task}
 
 
 @app.post('/api/progress/task')
@@ -537,4 +643,6 @@ def admin_stats(req: Request):
     refs=c.execute("SELECT COUNT(*) n FROM referrals WHERE status='qualified'").fetchone()['n']
     pending=c.execute("SELECT COUNT(*) n FROM referrals WHERE status='pending'").fetchone()['n']
     locked=get_locked(c)
-    c.commit(); c.close(); return {'total_users':total,'active_7d':active,'qualified_referrals':refs,'pending_referrals':pending,'community_locked':locked,'monthly_reward_tiers':REWARD_TIERS,'rank_stages':['Beginner','Amateur','Professional','Expert','Master','Pips Master']}
+    feedback_count=c.execute("SELECT COUNT(*) n FROM feedback WHERE status='new'").fetchone()['n']
+    c.commit(); c.close()
+    return {'total_users':total,'active_7d':active,'qualified_referrals':refs,'pending_referrals':pending,'feedback_new':feedback_count,'community_locked':locked,'monthly_reward_tiers':REWARD_TIERS,'rank_stages':['Beginner','Amateur','Professional','Expert','Master','Pips Master']}
