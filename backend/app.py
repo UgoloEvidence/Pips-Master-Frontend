@@ -8,7 +8,7 @@ from .market_data import fetch, analyze, pip_size, backtest
 ADMIN_EMAIL='ugoloevidence81@gmail.com'
 app=FastAPI(title='Pips Master Academy API')
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*'])
-DB=os.getenv('PMA_DB','pma.db'); pwd=CryptContext(schemes=['bcrypt'],deprecated='auto'); sessions={}; locked=False
+DB=os.getenv('PMA_DB','pma.db'); pwd=CryptContext(schemes=['bcrypt'],deprecated='auto'); sessions={}
 
 def db():
  c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
@@ -42,6 +42,13 @@ def current(req):
 def push_notice(c,username,title,text,typ='info'):
  c.execute('INSERT INTO notifications(username,title,text,type,created,read) VALUES(?,?,?,?,?,0)',(username,title,text,typ,int(time.time())))
 
+def get_locked(c):
+ r=c.execute("SELECT value FROM settings WHERE key='community_locked'").fetchone()
+ return bool(r and r['value']=='1')
+
+def set_locked(c,value):
+ c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('community_locked',?)",('1' if value else '0',))
+
 @app.get('/api/health')
 def health(): return {'ok':True}
 
@@ -66,6 +73,10 @@ def login(x:Login):
 
 @app.post('/api/auth/logout')
 def logout(req:Request): sessions.pop(req.headers.get('Authorization','').replace('Bearer ',''),None); return {'ok':True}
+
+@app.get('/api/auth/profile')
+def get_profile(req:Request):
+ u=current(req); return {'user':user_out(u)}
 
 @app.put('/api/auth/profile')
 def update_profile(req:Request,x:Profile):
@@ -96,7 +107,7 @@ def scan(market:str='Forex',symbols:str='EURUSD'):
     try: trends[tf]=analyze(fetch(sym,tf))['trend']
     except Exception: trends[tf]='Unavailable'
    pips=round(a['distance']/pip_size(sym),1); mins=a['candles_to_zone']*15; validation=backtest(rows); alignment=sum(1 for v in trends.values() if v==a['trend'])
-   opportunities.append({'symbol':sym,'market':market,'direction':a['direction'],'zone_type':a['zone_type'],'zone':round(a['zone'],8),'distance':round(a['distance'],8),'pips_to_zone':pips,'atr':round(a['atr'],8),'candles_to_zone':a['candles_to_zone'],'estimated_minutes_to_entry':mins,'timeframe':'15m','trends':trends,'trend_alignment':f'{alignment}/5','last':round(a['last'],8),'support':round(a['support'],8),'resistance':round(a['resistance'],8),'validation':validation,'status':'ZONE APPROACHING' if a['candles_to_zone']<=2 else 'WATCHING'})
+   opportunities.append({'symbol':sym,'market':market,'direction':a['direction'],'zone_type':a['zone_type'],'zone':round(a['zone'],8),'distance':round(a['distance'],8),'pips_to_zone':pips,'atr':round(a['atr'],8),'candles_to_zone':a['candles_to_zone'],'estimated_minutes_to_entry':mins,'timeframe':'15m','trends':trends,'trend_errors':trend_errors,'trend_alignment':f'{alignment}/5','last':round(a['last'],8),'support':round(a['support'],8),'resistance':round(a['resistance'],8),'validation':validation,'status':'ZONE APPROACHING' if a['candles_to_zone']<=2 else 'WATCHING'})
   except Exception as ex: errors.append({'symbol':sym,'error':str(ex)})
  opportunities.sort(key=lambda x:x['estimated_minutes_to_entry']); return {'closest':opportunities[0] if opportunities else None,'opportunities':opportunities,'errors':errors,'market':market,'symbols':requested,'message':('Verified candle data loaded.' if opportunities else 'No verified candle data was returned; no signal is being invented.')}
 
@@ -107,11 +118,11 @@ def candles(symbol:str='EURUSD',timeframe:str='15m'):
 
 @app.get('/api/community/messages')
 def get_messages(req:Request):
- current(req); c=db(); rows=c.execute('SELECT * FROM messages ORDER BY id ASC LIMIT 300').fetchall(); c.close(); return {'locked':locked,'messages':[{'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'time':time.strftime('%H:%M',time.localtime(r['created']))} for r in rows]}
+ current(req); c=db(); rows=c.execute('SELECT * FROM messages ORDER BY id ASC LIMIT 300').fetchall(); is_locked=get_locked(c); c.close(); return {'locked':is_locked,'messages':[{'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'time':time.strftime('%H:%M',time.localtime(r['created']))} for r in rows]}
 @app.post('/api/community/messages')
 def post_message(req:Request,x:Msg):
- global locked; u=current(req)
- if locked and u['role']!='admin': raise HTTPException(403,'Community chat is locked by the administrator.')
+ u=current(req); c0=db(); is_locked=get_locked(c0); c0.close()
+ if is_locked and u['role']!='admin': raise HTTPException(403,'Community chat is locked by the administrator.')
  if not x.text.strip() and not x.media_data: raise HTTPException(400,'Message cannot be empty.')
  c=db(); c.execute('INSERT INTO messages(username,pma_id,text,media_data,media_type,created) VALUES(?,?,?,?,?,?)',(u['username'],u['pma_id'],x.text,x.media_data,x.media_type,int(time.time())))
  # notify all other members
@@ -120,9 +131,9 @@ def post_message(req:Request,x:Msg):
  c.commit(); c.close(); return {'ok':True}
 @app.post('/api/admin/community/toggle')
 def toggle(req:Request):
- global locked; u=current(req)
+ u=current(req)
  if u['role']!='admin': raise HTTPException(403,'Admin access required.')
- locked=not locked; c=db();
+ c=db(); new_state=not get_locked(c); set_locked(c,new_state)
  users=c.execute('SELECT username FROM users').fetchall()
- for r in users: push_notice(c,r['username'],'Community status','The community is now '+('locked.' if locked else 'open.'),'community')
- c.commit(); c.close(); return {'locked':locked}
+ for r in users: push_notice(c,r['username'],'Community status','The community is now '+('locked.' if new_state else 'open.'),'community')
+ c.commit(); c.close(); return {'locked':new_state}

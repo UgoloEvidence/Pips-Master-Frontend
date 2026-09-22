@@ -2,9 +2,10 @@ import json, math, time, urllib.parse, urllib.request
 from statistics import mean
 
 YAHOO_MAP={
- 'EURUSD':'EURUSD=X','GBPUSD':'GBPUSD=X','USDJPY':'JPY=X','USDCHF':'CHF=X','AUDUSD':'AUDUSD=X','USDCAD':'CAD=X','NZDUSD':'NZDUSD=X','EURGBP':'EURGBP=X','EURJPY':'EURJPY=X','GBPJPY':'GBPJPY=X','AUDJPY':'AUDJPY=X','EURAUD':'EURAUD=X','GBPAUD':'GBPAUD=X','XAUUSD':'GC=F','XAGUSD':'SI=F','WTI':'CL=F','USOIL':'CL=F','BRENT':'BZ=F','NATGAS':'NG=F','SPX':'^GSPC','SP500':'^GSPC','NAS100':'^NDX','NDX':'^NDX','US30':'^DJI','DOW':'^DJI','DAX':'^GDAXI','FTSE100':'^FTSE','NIKKEI':'^N225','BTCUSD':'BTC-USD','ETHUSD':'ETH-USD','XRPUSD':'XRP-USD','SOLUSD':'SOL-USD','BNBUSD':'BNB-USD','ADAUSD':'ADA-USD'}
+ 'EURUSD':'EURUSD=X','GBPUSD':'GBPUSD=X','USDJPY':'JPY=X','USDCHF':'CHF=X','AUDUSD':'AUDUSD=X','USDCAD':'CAD=X','NZDUSD':'NZDUSD=X','EURGBP':'EURGBP=X','EURJPY':'EURJPY=X','GBPJPY':'GBPJPY=X','AUDJPY':'AUDJPY=X','EURAUD':'EURAUD=X','GBPAUD':'GBPAUD=X','XAUUSD':'GC=F','XAGUSD':'SI=F','XPTUSD':'PL=F','XPDUSD':'PA=F','WTI':'CL=F','USOIL':'CL=F','UKOIL':'BZ=F','BRENT':'BZ=F','NATGAS':'NG=F','COPPER':'HG=F','SPX':'^GSPC','SP500':'^GSPC','SPX500':'^GSPC','NAS100':'^NDX','NDX':'^NDX','US30':'^DJI','DOW':'^DJI','DAX':'^GDAXI','GER40':'^GDAXI','FTSE100':'^FTSE','UK100':'^FTSE','NIKKEI':'^N225','JP225':'^N225','FRA40':'^FCHI','BTCUSD':'BTC-USD','ETHUSD':'ETH-USD','XRPUSD':'XRP-USD','SOLUSD':'SOL-USD','BNBUSD':'BNB-USD','ADAUSD':'ADA-USD','LTCUSD':'LTC-USD'}
 INTERVALS={'15m':'15m','30m':'30m','1h':'1h','1d':'1d'}
 RANGES={'15m':'7d','30m':'20d','1h':'45d','1d':'900d'}
+CACHE={}
 
 def yahoo_symbol(s):
  s=s.upper().replace('/','').replace('-','')
@@ -31,12 +32,25 @@ def fetch(symbol, interval):
     ys=yahoo_symbol(symbol)
     if not ys: raise ValueError(f'Unsupported symbol: {symbol}')
     days={'15m':7,'30m':20,'1h':45,'1d':900}[interval]
-    params=urllib.parse.urlencode({'period1':int(time.time())-days*86400,'period2':int(time.time()),'interval':INTERVALS[interval],'events':'history','includeAdjustedClose':'true'})
-    url='https://query1.finance.yahoo.com/v8/finance/chart/'+urllib.parse.quote(ys,safe='')+'?'+params
-    req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 PipsMasterAcademy/1.0'})
-    with urllib.request.urlopen(req,timeout=12) as r: raw=json.loads(r.read().decode())
-    result=(raw.get('chart') or {}).get('result') or []
-    if not result: raise ValueError(f'No verified market response for {symbol} {interval}')
+    key=(symbol.upper(),interval); now=time.time()
+    cached=CACHE.get(key)
+    if cached and now-cached[0] < 20:
+        return cached[1]
+    params=urllib.parse.urlencode({'period1':int(now)-days*86400,'period2':int(now),'interval':INTERVALS[interval],'events':'history','includeAdjustedClose':'true'})
+    raw=None; last_error=None
+    for host in ('query1.finance.yahoo.com','query2.finance.yahoo.com'):
+        url='https://'+host+'/v8/finance/chart/'+urllib.parse.quote(ys,safe='')+'?'+params
+        req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 PipsMasterAcademy/1.0','Accept':'application/json'})
+        try:
+            with urllib.request.urlopen(req,timeout=12) as r: raw=json.loads(r.read().decode())
+            result=(raw.get('chart') or {}).get('result') or []
+            if result: break
+            last_error=ValueError(f'No verified market response for {symbol} {interval}')
+        except Exception as ex:
+            last_error=ex
+    result=(raw.get('chart') or {}).get('result') if raw else []
+    result=result or []
+    if not result: raise ValueError(f'No verified market response for {symbol} {interval}: {last_error}')
     res=result[0]; ts=res.get('timestamp') or []; q=res['indicators']['quote'][0]
     rows=[]
     for i,t in enumerate(ts):
@@ -45,6 +59,7 @@ def fetch(symbol, interval):
             if None not in (o,h,l,c): rows.append({'t':t,'open':float(o),'high':float(h),'low':float(l),'close':float(c),'volume':float(v or 0)})
         except (IndexError,TypeError,ValueError): pass
     if len(rows)<60: raise ValueError(f'Not enough verified candle data for {symbol} {interval}')
+    CACHE[key]=(now,rows)
     return rows
 
 def ema(vals,n):
