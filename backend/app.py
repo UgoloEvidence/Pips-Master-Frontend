@@ -1,18 +1,29 @@
 from datetime import datetime, timedelta, timezone
 import base64, hashlib, hmac, json
-import os, random, secrets, sqlite3, time
+import os, random, secrets, sqlite3, time, re
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import bcrypt
+try:
+    from pywebpush import webpush, WebPushException
+except Exception:
+    webpush = None
+    WebPushException = Exception
 from pydantic import BaseModel, EmailStr
 
 from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso
 
-ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').lower()
+ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').strip().lower()
+ADMIN_PASSWORD = os.getenv('PMA_ADMIN_PASSWORD', '').strip()
+ADMIN_USERNAME = os.getenv('PMA_ADMIN_USERNAME', 'PipsMaster').strip() or 'PipsMaster'
+ADMIN_FULL_NAME = os.getenv('PMA_ADMIN_FULL_NAME', 'Ugolo Evidence').strip() or 'PMA Administrator'
 TOKEN_SECRET = os.getenv('PMA_SECRET_KEY', '') or 'pma-dev-secret-change-this-in-render'
 TOKEN_TTL = int(os.getenv('PMA_TOKEN_TTL', str(60*60*24*30)))
 QUALIFICATION_HOURS = int(os.getenv('PMA_REFERRAL_QUALIFICATION_HOURS', '48'))
+VAPID_PUBLIC_KEY = os.getenv('PMA_VAPID_PUBLIC_KEY', '').strip()
+VAPID_PRIVATE_KEY = os.getenv('PMA_VAPID_PRIVATE_KEY', '').strip()
+VAPID_SUBJECT = os.getenv('PMA_VAPID_SUBJECT', 'mailto:ugoloevidence81@gmail.com').strip()
 DB = os.getenv('PMA_DB', 'pma.db')
 sessions = {}
 
@@ -162,6 +173,10 @@ def db():
     c.execute('''CREATE TABLE IF NOT EXISTS activity_log(
         id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, event_type TEXT NOT NULL, created INTEGER NOT NULL
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS push_subscriptions(
+        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL,
+        p256dh TEXT NOT NULL, auth TEXT NOT NULL, created INTEGER NOT NULL, last_used INTEGER NOT NULL
+    )''')
     # Small migrations for databases created by previous PMA versions.
     notif_existing = {r['name'] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
     for name, ddl in {
@@ -191,7 +206,7 @@ def month_key(ts=None):
 def user_out(row):
     return {
         'username': row['username'], 'full_name': row['full_name'], 'email': row['email'],
-        'pma_id': row['pma_id'], 'referral_code': row['referral_code'], 'role': row['role'],
+        'pma_id': row['pma_id'], 'referral_code': row['referral_code'], 'role': ('admin' if str(row['email']).lower() == ADMIN_EMAIL else row['role']),
         'phone': row['phone'] or '', 'dob': row['dob'] or '', 'profile_picture': row['profile_picture'] or '',
     }
 
@@ -295,8 +310,29 @@ def notification_target(typ):
 
 def push_notice(c, username, title, text, typ='info', target_page=''):
     page = target_page or notification_target(typ)
+    now = int(time.time())
     c.execute('INSERT INTO notifications(username,title,text,type,created,read,target_page,target_ref) VALUES(?,?,?,?,?,?,?,?)',
-              (username,title,text,typ,int(time.time()),0,page,''))
+              (username,title,text,typ,now,0,page,''))
+    # Optional Web Push: works even when the PMA tab is not the active tab.
+    if webpush and VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY:
+        row = c.execute('SELECT id FROM users WHERE username=? LIMIT 1', (username,)).fetchone()
+        if row:
+            subs = c.execute('SELECT * FROM push_subscriptions WHERE user_id=?', (row['id'],)).fetchall()
+            payload = json.dumps({'title': title, 'body': text, 'type': typ, 'target_page': page})
+            for sub in subs:
+                subscription_info = {
+                    'endpoint': sub['endpoint'],
+                    'keys': {'p256dh': sub['p256dh'], 'auth': sub['auth']}
+                }
+                try:
+                    webpush(subscription_info=subscription_info, data=payload, vapid_private_key=VAPID_PRIVATE_KEY,
+                            vapid_claims={'sub': VAPID_SUBJECT})
+                    c.execute('UPDATE push_subscriptions SET last_used=? WHERE id=?', (now, sub['id']))
+                except Exception as exc:
+                    # Expired subscriptions are harmless; delete common 404/410 failures.
+                    msg = str(exc)
+                    if '404' in msg or '410' in msg or 'Gone' in msg:
+                        c.execute('DELETE FROM push_subscriptions WHERE id=?', (sub['id'],))
 
 
 def get_locked(c):
@@ -317,7 +353,9 @@ def current(req: Request):
     c = db(); row = c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
     if not row:
         c.close(); raise HTTPException(401,'Session expired.')
-    # Update presence only; do not inflate activity_count just because the UI polls the API.
+    if is_admin_email(row['email']) and row['role'] != 'admin':
+        c.execute("UPDATE users SET role='admin' WHERE id=?",(uid,))
+        row = c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
     c.execute('UPDATE users SET last_active=? WHERE id=?',(int(time.time()),uid)); c.commit(); c.close()
     return row
 
@@ -326,6 +364,42 @@ def resolve_referrer(c, referral):
     value = (referral or '').strip()
     if not value: return None
     return c.execute('SELECT * FROM users WHERE lower(referral_code)=lower(?) OR lower(username)=lower(?) OR lower(pma_id)=lower(?) LIMIT 1',(value,value,value)).fetchone()
+
+
+def is_admin_email(email):
+    return str(email or '').strip().lower() == ADMIN_EMAIL
+
+
+def ensure_admin_row(c, password=''):
+    row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)', (ADMIN_EMAIL,)).fetchone()
+    if row:
+        if is_admin_email(row['email']) and row['role'] != 'admin':
+            c.execute("UPDATE users SET role='admin' WHERE id=?", (row['id'],))
+            row = c.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone()
+        if password and ADMIN_PASSWORD and password == ADMIN_PASSWORD and not verify_password(password, row['password']):
+            c.execute("UPDATE users SET password=?,role='admin' WHERE id=?", (hash_password(password), row['id']))
+            row = c.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone()
+        return row
+    if not (ADMIN_PASSWORD and password == ADMIN_PASSWORD):
+        return None
+    username = ADMIN_USERNAME
+    base = username
+    n = 2
+    while c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?)', (username,)).fetchone():
+        username = f'{base}{n}'
+        n += 1
+    pma = 'PMA-ADMIN001'
+    if c.execute('SELECT 1 FROM users WHERE pma_id=?', (pma,)).fetchone():
+        pma = f'PMA-ADMIN-{secrets.token_hex(3).upper()}'
+    code = pma.replace('-', '')
+    now = int(time.time())
+    c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+              (username, ADMIN_FULL_NAME, ADMIN_EMAIL, hash_password(password), pma, code, '', 'admin', now, 0, now, 0, 1))
+    uid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
+    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',
+              (uid, datetime.fromtimestamp(now, timezone.utc).strftime('%Y-%m-%d'), 'admin_bootstrap', now))
+    push_notice(c, username, 'Administrator account ready', 'Your PMA administrator account is ready.', 'account', 'profile')
+    return c.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
 
 
 def qualify_referrals(c):
@@ -341,6 +415,14 @@ def qualify_referrals(c):
             # Keep it pending; the qualification check can run again after the member becomes active.
             c.execute('UPDATE referrals SET qualification_due=? WHERE id=?',(now + 24*3600,r['id']))
     c.commit()
+
+
+@app.on_event('startup')
+def startup_prepare():
+    c = db()
+    if ADMIN_PASSWORD:
+        ensure_admin_row(c, ADMIN_PASSWORD)
+    c.close()
 
 
 @app.get('/api/health')
@@ -380,14 +462,34 @@ def signup(x: Signup):
 
 @app.post('/api/auth/login')
 def login(x: Login):
-    c = db(); row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(str(x.email),)).fetchone()
-    if not row or not verify_password(x.password,row['password']): c.close(); raise HTTPException(401,'Email or password is incorrect.')
+    email = str(x.email).strip().lower()
+    c = db()
+    row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)', (email,)).fetchone()
+    if is_admin_email(email):
+        # The designated admin email is never device-locked. Each successful login creates a fresh signed token.
+        if ADMIN_PASSWORD and x.password == ADMIN_PASSWORD:
+            row = ensure_admin_row(c, x.password)
+        elif row and verify_password(x.password, row['password']):
+            # Existing admin row can still authenticate from any device.
+            c.execute("UPDATE users SET role='admin' WHERE id=?", (row['id'],))
+            row = c.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone()
+        elif not row:
+            c.close(); raise HTTPException(503, 'Administrator account is not initialized. Set PMA_ADMIN_PASSWORD in Render and redeploy the backend once.')
+        else:
+            c.close(); raise HTTPException(401, 'Administrator email is recognized, but the password is incorrect.')
+    elif not row or not verify_password(x.password, row['password']):
+        c.close(); raise HTTPException(401,'Email or password is incorrect.')
+    if not row:
+        c.close(); raise HTTPException(500,'Administrator account could not be prepared.')
+    if is_admin_email(row['email']) and row['role'] != 'admin':
+        c.execute("UPDATE users SET role='admin' WHERE id=?", (row['id'],))
+        row = c.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone()
     now = int(time.time())
     c.execute('UPDATE users SET last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,row['id']))
     c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
-    push_notice(c,row['username'],'New login','Your account was signed in successfully.','security'); c.commit(); c.close()
-    token=make_token(row['id'])
-    return {'user':user_out(row),'token':token}
+    push_notice(c,row['username'],'New login','Your account was signed in successfully.','security','profile')
+    c.commit(); c.close()
+    return {'user':user_out(row),'token':make_token(row['id'])}
 
 
 @app.post('/api/auth/logout')
@@ -404,15 +506,22 @@ def get_profile(req: Request):
 @app.put('/api/auth/profile')
 def update_profile(req: Request, x: Profile):
     u=current(req); c=db()
-    if c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?) AND id<>?',(x.username,u['id'])).fetchone():
+    full_name=x.full_name.strip()[:120]
+    new_username=x.username.strip()[:40]
+    if not full_name:
+        c.close(); raise HTTPException(400,'Full name cannot be empty.')
+    if not re.match(r'^[A-Za-z0-9_.-]{3,40}$', new_username):
+        c.close(); raise HTTPException(400,'Username must be 3-40 characters and use letters, numbers, underscore, dot or hyphen.')
+    if c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?) AND id<>?',(new_username,u['id'])).fetchone():
         c.close(); raise HTTPException(400,'That username is already in use.')
-    old_username = u['username']
-    new_username = x.username.strip()
-    c.execute('UPDATE users SET full_name=?,username=?,phone=?,dob=?,profile_picture=?,last_active=? WHERE id=?',(x.full_name.strip(),new_username,x.phone.strip(),x.dob,x.profile_picture or '',int(time.time()),u['id']))
+    old_username=u['username']
+    c.execute('UPDATE users SET full_name=?,username=?,phone=?,dob=?,profile_picture=?,last_active=? WHERE id=?',
+              (full_name,new_username,x.phone.strip()[:40],x.dob or '',x.profile_picture or '',int(time.time()),u['id']))
     c.execute('UPDATE notifications SET username=? WHERE username=?',(new_username,old_username))
-    c.execute('UPDATE referrals SET reason=reason WHERE referred_id=?',(u['id'],))
-    push_notice(c,x.username.strip(),'Profile saved','Your profile changes were saved successfully.','account'); c.commit()
-    row=c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone(); c.close(); return {'user':user_out(row)}
+    push_notice(c,new_username,'Profile saved','Your profile changes were saved successfully.','account','profile')
+    c.commit()
+    row=c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone(); c.close()
+    return {'user':user_out(row)}
 
 
 @app.put('/api/auth/password')
@@ -420,6 +529,39 @@ def change_password(req: Request, x: PasswordChange):
     u=current(req)
     if len(x.password) < 8: raise HTTPException(400,'Password must be at least 8 characters.')
     c=db(); c.execute('UPDATE users SET password=? WHERE id=?',(hash_password(x.password),u['id'])); push_notice(c,u['username'],'Password updated','Your password was updated successfully.','security'); c.commit(); c.close(); return {'ok':True}
+
+
+class PushSubscription(BaseModel):
+    endpoint: str
+    keys: dict
+
+
+@app.get('/api/push/config')
+def push_config(req: Request):
+    current(req)
+    return {'enabled': bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY), 'public_key': VAPID_PUBLIC_KEY}
+
+
+@app.post('/api/push/subscribe')
+def push_subscribe(req: Request, x: PushSubscription):
+    u = current(req)
+    endpoint = str(x.endpoint or '').strip()
+    p256dh = str((x.keys or {}).get('p256dh') or '').strip()
+    auth = str((x.keys or {}).get('auth') or '').strip()
+    if not endpoint or not p256dh or not auth:
+        raise HTTPException(400, 'Push subscription is incomplete.')
+    c = db(); now = int(time.time())
+    c.execute('''INSERT INTO push_subscriptions(user_id,endpoint,p256dh,auth,created,last_used)
+                 VALUES(?,?,?,?,?,?)
+                 ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,last_used=excluded.last_used''',
+              (u['id'], endpoint, p256dh, auth, now, now))
+    c.commit(); c.close()
+    return {'ok': True}
+
+
+@app.delete('/api/push/subscribe')
+def push_unsubscribe(req: Request, x: PushSubscription):
+    u = current(req); c = db(); c.execute('DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?',(u['id'],x.endpoint)); c.commit(); c.close(); return {'ok': True}
 
 
 @app.get('/api/notifications')
@@ -681,7 +823,7 @@ def post_message(req: Request, x: Msg):
 @app.post('/api/admin/community/toggle')
 def toggle(req: Request):
     u=current(req)
-    if u['role']!='admin': raise HTTPException(403,'Admin access required.')
+    if not is_admin_email(u['email']) and u['role']!='admin': raise HTTPException(403,'Admin access required.')
     c=db(); new_state=not get_locked(c); set_locked(c,new_state)
     users=c.execute('SELECT username FROM users').fetchall()
     for r in users: push_notice(c,r['username'],'Community status','The community is now '+('locked.' if new_state else 'open.'),'community')
@@ -691,7 +833,7 @@ def toggle(req: Request):
 @app.get('/api/admin/status')
 def admin_status(req: Request):
     u=current(req)
-    if u['role']!='admin':
+    if not is_admin_email(u['email']) and u['role']!='admin':
         raise HTTPException(403,'Admin access required.')
     c=db(); locked=get_locked(c); c.close()
     return {'is_admin':True,'username':u['username'],'email':u['email'],'community_locked':locked}
@@ -700,7 +842,7 @@ def admin_status(req: Request):
 @app.get('/api/admin/stats')
 def admin_stats(req: Request):
     u=current(req)
-    if u['role']!='admin': raise HTTPException(403,'Admin access required.')
+    if not is_admin_email(u['email']) and u['role']!='admin': raise HTTPException(403,'Admin access required.')
     c=db(); qualify_referrals(c)
     total=c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
     active=c.execute('SELECT COUNT(*) n FROM users WHERE last_active>=?',(int(time.time())-7*86400,)).fetchone()['n']
