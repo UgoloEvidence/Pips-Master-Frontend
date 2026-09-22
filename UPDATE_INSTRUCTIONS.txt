@@ -1,12 +1,84 @@
-PMA V4 UPDATE
+PIPS MASTER ACADEMY — FULL REBUILD
 
-1. Replace frontend/ and backend/ in your existing pma_full_rebuilt folder.
-2. Keep your existing local data files out of Git.
-3. In Render Environment Variables, set PMA_ADMIN_EMAIL to your admin email and PMA_ADMIN_PASSWORD to your administrator password.
-4. Keep PMA_SECRET_KEY stable between deployments.
-5. Optional device notifications: set PMA_VAPID_PUBLIC_KEY, PMA_VAPID_PRIVATE_KEY and PMA_VAPID_SUBJECT in Render.
-6. Commit and push: git add frontend backend .gitignore && git commit -m "PMA V4 admin profile notifications" && git push origin main
-7. Vercel deploys frontend; Render deploys backend.
-8. Log in again after deployment so a fresh token is created.
+This package keeps the existing PMA welcome page, login/signup, admin area, light/dark mode support, navigation, scanner, calculator, progress, referrals, community, feedback and profile sections.
 
-Admin-only behavior: the configured admin email is recognized on any device; it is not device-locked. Credentials remain server-side.
+The requested refinements are included:
+- Welcome page remains the first page.
+- Light/Dark mode toggle is in the hamburger menu.
+- Home Academy Rank, Learning, Referral and Overall are horizontal mini-cards on laptop/desktop and responsive on smaller screens.
+- Top-right notifications are scrollable and have Clear. Clear only removes the recent inbox; full notification history remains.
+- Full notification history is retained for 14 days.
+- Scanner has Scalping, Day Trading and Swing Trading styles with selectable trigger timeframes.
+- Scanner estimates candles/time to the next setup and shows the trigger timeframe.
+- Scanner locks entry/SL/TP after a setup triggers and keeps the active setup fixed until its direction changes.
+- Scanner uses verified market-data responses and multiple confluence checks.
+- Day Trade has a selectable trigger timeframe and a clearer setup presentation.
+- My Progress loads from the deployed API without showing backend/API status text to members.
+- Referral targets and cash amounts are removed. Monthly leaderboard shows the top 10, while each member can see their own live position and monthly count even outside the top 10.
+- Community messages are stored in the backend so they remain available to all members.
+- Feedback awards XP based on the submitted star rating and is stored against the member account.
+- The referral-link FIELD is kept inside its existing card and does not horizontally scroll. The rest of the profile card is unchanged.
+- Normal site errors are presented as user-friendly messages rather than backend/API implementation details.
+- No automatic full-page reload is used for live updates; pull-down refresh is a soft refresh.
+
+RENDER ENVIRONMENT VARIABLES
+PMA_DB=pma.db
+PMA_SECRET_KEY=<keep your existing secret stable>
+PMA_ADMIN_EMAIL=ugoloevidence81@gmail.com
+PMA_ADMIN_USERNAME=PipsMaster
+PMA_ADMIN_FULL_NAME=Ugolo Evidence
+PMA_ADMIN_PASSWORD=<set privately in Render; do not commit it>
+PMA_TOKEN_TTL=2592000
+PMA_REFERRAL_QUALIFICATION_HOURS=48
+
+GIT UPDATE
+From:
+C:\Users\Confidence Ugolo\Desktop\pma_full_rebuilt
+
+Run:
+git status
+git add frontend backend .gitignore
+git commit -m "Rebuild PMA with requested dashboard and scanner corrections"
+git push origin main
+
+IMPORTANT
+Do not commit a real .env file or any password/secret.
+For multi-year production persistence, SQLite needs persistent storage or a managed PostgreSQL database.
+
+Latest scanner/theme correction:
+- Automated scanner trigger timeframe list is now exactly 1m, 5m, 15m, 1h, 4h, 1d for all three trading styles.
+- Scanner backend accepts 1m, 5m, 15m, 1h, 4h and 1d trigger timeframes.
+- TradingView interval follows the selected scanner timeframe, including correct 1D and 4H values.
+- Multi-timeframe context remains 15m, 30m, 1h, 4h and 1d and displays Bullish/Bearish/Neutral when verified data is returned.
+- Theme control is an icon plus Dark mode/Light mode text rather than a filled button.
+- Light mode has additional text/input/control contrast overrides so dark-theme white text does not remain hard to read.
+
+## Deployment fix: scanner and daily signal data connection
+
+This patch improves the live Render market-data path:
+- Yahoo Finance chart requests now use bounded `range` requests (7d/60d/180d/5y) instead of calculated period timestamps.
+- Both Yahoo chart hosts are tried with a browser-like request header and an 18-second timeout.
+- Temporary provider failures can reuse an already cached candle set instead of immediately breaking an active scan.
+- Added `GET /api/health` for a simple backend health check.
+- Added `GET /api/market-data/test?symbol=EURUSD&timeframe=15m` to test live candle fetching.
+- Scanner and Day Trade requests retry automatically up to two additional times.
+- Day Trade timeframe selector now uses exactly 1m, 5m, 15m, 1h, 4h, 1d.
+
+After pushing to GitHub, Render should redeploy the backend. Test these endpoints in a browser after deployment:
+`/api/health`
+`/api/market-data/test?symbol=EURUSD&timeframe=15m`
+`/api/market-data/test?symbol=EURUSD&timeframe=1d`
+`/api/signals/scan?market=Forex&symbols=EURUSD&timeframe=1d`
+`/api/day-trade/plan?market=Forex&symbols=EURUSD&timeframe=15m`
+
+
+## Direction-mapping / false-ready fix
+- The scanner no longer treats a bullish/bearish trend alone as a confirmed BUY/SELL.
+- The selected trigger timeframe is now the actual trigger source.
+- BUY requires bullish trigger-timeframe trend, RSI confirmation, bullish recent structure and multi-timeframe support; it remains APPROACHING until price closes above the prior five-candle high.
+- SELL requires the mirrored conditions and remains APPROACHING until price closes below the prior five-candle low.
+- The previous trigger calculation incorrectly included the current candle in the five-candle high/low, which could make confirmation logically inconsistent. The trigger now uses the five completed candles immediately before the current candle.
+- Entry, SL and TP are calculated from the confirmed setup and the frontend freezes those levels once TRIGGERED/ACTIVE. Polling cannot move active levels unless the setup direction changes.
+- Stop loss uses recent structure plus a small ATR buffer rather than a 60-candle extreme. This is a tighter structure-aware stop, not a guarantee against stop-outs.
+- Historical validation now tests the same breakout/breakdown trigger concept and reports samples/wins/losses/win rate. A historical result is not a guarantee of future performance.
+- The UI shows WATCH BUY/WATCH SELL while a setup is only approaching; it shows BUY/SELL only after confirmation.

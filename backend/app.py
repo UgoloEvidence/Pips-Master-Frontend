@@ -530,8 +530,9 @@ def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
         'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
         'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),
         'timeframe':trigger_timeframe,'atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),'support':round(setup['support'],8),'resistance':round(setup['resistance'],8),
-        'rsi_15m':setup['rsi'],'structure':setup['structure'],'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,
-        'next_signal_status':'TRIGGERED' if setup['score'] >= 65 else 'WAITING FOR CONFIRMATION',
+        'rsi_trigger':setup['rsi'],'structure':setup['structure'],'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,
+        'next_signal_status':'TRIGGERED' if setup['status']=='SIGNAL READY' else 'WAITING FOR CONFIRMATION',
+        'trade_state':'ACTIVE' if setup['status']=='SIGNAL READY' else setup['status'],
         'next_signal_trigger':setup['trigger_text'],'reasons':reasons,
         'trends':{tf:trends[tf]['trend'] for tf in trends},'trend_detail':trends,'trend_alignment':f"{sum(1 for v in trends.values() if v['trend']==setup['trend'])}/5",
         'validation':validation,'data_source':'Verified market chart feed','updated_at':utc_iso(),'method':'PMA confluence engine: trend + RSI + structure + multi-timeframe alignment + ATR zone projection'

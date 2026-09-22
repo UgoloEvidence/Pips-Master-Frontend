@@ -255,127 +255,204 @@ def structure_label(rows):
     return 'Range / mixed structure'
 
 
-def analyze_setup(rows15, frames, trigger_timeframe='15m'):
-    t15 = trend_info(rows15)
+def analyze_setup(rows_trigger, frames, trigger_timeframe='15m'):
+    """Build a conservative setup from the selected trigger timeframe plus fixed MTF context.
+
+    Direction is not emitted as a READY trade merely because the higher-timeframe trend
+    is bullish/bearish.  A directional setup needs trigger-timeframe trend, momentum,
+    structure and a real breakout/rejection trigger.  This avoids the old behaviour
+    where a SELL/BUY label could appear while price had not actually crossed the trigger.
+    """
+    t = trend_info(rows_trigger)
     tf_minutes = TIMEFRAME_MINUTES.get(trigger_timeframe, 15)
-    last = rows15[-1]['close']
-    a = atr(rows15)
-    support = t15['support']
-    resistance = t15['resistance']
-    trend_scores = []
-    for key in ('15m','30m','1h','4h','1d'):
-        info = trend_info(frames[key])
-        trend_scores.append(info['trend'])
+    last = rows_trigger[-1]['close']
+    a = atr(rows_trigger)
+    # Use recent structure for a tighter, setup-specific risk boundary instead of a
+    # 60-candle extreme that could make the stop disproportionately wide.
+    recent = rows_trigger[-12:]
+    recent_low = min(r['low'] for r in recent[:-1]) if len(recent) > 1 else t['support']
+    recent_high = max(r['high'] for r in recent[:-1]) if len(recent) > 1 else t['resistance']
+    prev5_high = max(r['high'] for r in rows_trigger[-6:-1]) if len(rows_trigger) >= 6 else recent_high
+    prev5_low = min(r['low'] for r in rows_trigger[-6:-1]) if len(rows_trigger) >= 6 else recent_low
+
+    context_trends = {key: trend_info(frames[key]) for key in ('15m','30m','1h','4h','1d')}
+    trend_scores = [v['trend'] for v in context_trends.values()]
     bullish_count = trend_scores.count('Bullish')
     bearish_count = trend_scores.count('Bearish')
-    if bullish_count >= 3 and bearish_count <= 1:
-        direction = 'BUY'
-    elif bearish_count >= 3 and bullish_count <= 1:
-        direction = 'SELL'
-    else:
-        # Keep the current trend as the directional idea, but flag weak/conflicted conditions.
-        direction = 'BUY' if t15['trend'] == 'Bullish' else 'SELL' if t15['trend'] == 'Bearish' else 'NO TRADE'
 
-    structure = structure_label(rows15)
-    score = 0
+    structure = structure_label(rows_trigger)
+    trigger_up = last > prev5_high
+    trigger_down = last < prev5_low
+
+    # Selected timeframe drives the scanner; MTF context is confirmation, not the trigger.
+    buy_confluence = (
+        t['trend'] == 'Bullish' and t['rsi'] >= 50 and
+        ('bullish' in structure.lower()) and bullish_count >= 2
+    )
+    sell_confluence = (
+        t['trend'] == 'Bearish' and t['rsi'] <= 50 and
+        ('bearish' in structure.lower()) and bearish_count >= 2
+    )
+
+    direction = 'NO TRADE'
+    status = 'WAITING FOR CONFIRMATION'
     reasons = []
+    trigger_price = None
+
+    if buy_confluence:
+        direction = 'BUY'
+        reasons += ['Selected trigger timeframe is bullish', 'Momentum confirms BUY', 'Recent structure is bullish',
+                    f'{bullish_count}/5 context timeframes are bullish']
+        trigger_price = prev5_high
+        if trigger_up:
+            status = 'SIGNAL READY'
+            reasons.append(f'{trigger_timeframe} close confirmed above the prior 5-candle high')
+        else:
+            status = 'APPROACHING'
+            reasons.append(f'Waiting for {trigger_timeframe} close above {trigger_price:.8f}')
+    elif sell_confluence:
+        direction = 'SELL'
+        reasons += ['Selected trigger timeframe is bearish', 'Momentum confirms SELL', 'Recent structure is bearish',
+                    f'{bearish_count}/5 context timeframes are bearish']
+        trigger_price = prev5_low
+        if trigger_down:
+            status = 'SIGNAL READY'
+            reasons.append(f'{trigger_timeframe} close confirmed below the prior 5-candle low')
+        else:
+            status = 'APPROACHING'
+            reasons.append(f'Waiting for {trigger_timeframe} close below {trigger_price:.8f}')
+    else:
+        reasons.append('Confluence is insufficient for a directional setup')
+        if t['trend'] != 'Neutral':
+            reasons.append(f'{trigger_timeframe} trend is {t["trend"]}, but confirmation is incomplete')
+
+    # Tight, structure-aware stop: a small ATR buffer beyond the recent swing.
+    # It is not a guarantee against a stop-out; the buffer is intentionally configurable.
+    buffer = max(a * 0.15, 1e-12)
     if direction == 'BUY':
-        if t15['trend'] == 'Bullish': score += 20; reasons.append('15m trend is bullish')
-        if bullish_count >= 3: score += 25; reasons.append('multiple timeframes support BUY')
-        if t15['rsi'] >= 50: score += 10; reasons.append('RSI supports positive momentum')
-        if 'bullish' in structure.lower(): score += 10; reasons.append('recent structure is bullish')
-        entry_zone = support + a * 0.25
-        zone_type = 'Demand / support'
-        next_zone = resistance
+        entry_zone = prev5_high if trigger_up else prev5_high
+        stop_loss = recent_low - buffer
+        risk = max(entry_zone - stop_loss, buffer)
+        tp1 = entry_zone + risk
+        tp2 = entry_zone + risk * 2
+        next_zone = t['resistance']
         next_zone_type = 'Supply / resistance'
-        stop_loss = support - a * 0.25
-        risk = max(last - stop_loss, a * 0.25)
-        tp1 = last + risk
-        tp2 = last + risk * 2
-        trigger_price = t15['trigger_high']
-        trigger_text = f'{trigger_timeframe} close above {trigger_price:.8f}'
+        zone_type = 'Breakout / demand confirmation'
     elif direction == 'SELL':
-        if t15['trend'] == 'Bearish': score += 20; reasons.append('15m trend is bearish')
-        if bearish_count >= 3: score += 25; reasons.append('multiple timeframes support SELL')
-        if t15['rsi'] <= 50: score += 10; reasons.append('RSI supports negative momentum')
-        if 'bearish' in structure.lower(): score += 10; reasons.append('recent structure is bearish')
-        entry_zone = resistance - a * 0.25
-        zone_type = 'Supply / resistance'
-        next_zone = support
+        entry_zone = prev5_low if trigger_down else prev5_low
+        stop_loss = recent_high + buffer
+        risk = max(stop_loss - entry_zone, buffer)
+        tp1 = entry_zone - risk
+        tp2 = entry_zone - risk * 2
+        next_zone = t['support']
         next_zone_type = 'Demand / support'
-        stop_loss = resistance + a * 0.25
-        risk = max(stop_loss - last, a * 0.25)
-        tp1 = last - risk
-        tp2 = last - risk * 2
-        trigger_price = t15['trigger_low']
-        trigger_text = f'{trigger_timeframe} close below {trigger_price:.8f}'
+        zone_type = 'Breakdown / supply confirmation'
     else:
         return {
-            'direction':'NO TRADE', 'score':score, 'status':'MULTI-TF CONFLICT', 'reasons':['Timeframes are not sufficiently aligned'],
-            'structure':structure, 'trigger_text':'Wait for multi-timeframe alignment', 'trigger_price':None,
-            'entry_zone':None, 'stop_loss':None, 'take_profit_1':None, 'take_profit_2':None,
-            'next_zone':None, 'next_zone_type':None, 'candles_to_next_zone':None, 'estimated_minutes_to_next_zone':None,
-            'distance_to_next_zone':None, 'atr':a, 'last':last, 'support':support, 'resistance':resistance,
-            'rsi':t15['rsi'], 'trend':t15['trend'], 'trend_scores':trend_scores,
+            'direction':'NO TRADE', 'score':0, 'status':'WAITING FOR CONFIRMATION',
+            'reasons':reasons, 'structure':structure,
+            'trigger_text':f'Wait for {trigger_timeframe} confirmation',
+            'trigger_price':None, 'entry_zone':None, 'stop_loss':None,
+            'take_profit_1':None, 'take_profit_2':None, 'next_zone':None,
+            'next_zone_type':None, 'candles_to_next_zone':None,
+            'estimated_minutes_to_next_zone':None, 'distance_to_next_zone':None,
+            'atr':a, 'last':last, 'support':t['support'], 'resistance':t['resistance'],
+            'rsi':t['rsi'], 'trend':t['trend'], 'trend_scores':trend_scores,
+            'context_trends':context_trends, 'zone_type':None
         }
+
+    score = 0
+    score += 25 if t['trend'] in ('Bullish','Bearish') else 0
+    score += 20 if ((direction == 'BUY' and t['rsi'] >= 50) or (direction == 'SELL' and t['rsi'] <= 50)) else 0
+    score += 15 if ('bullish' in structure.lower() if direction == 'BUY' else 'bearish' in structure.lower()) else 0
+    score += min(25, (bullish_count if direction == 'BUY' else bearish_count) * 5)
+    score += 15 if (trigger_up if direction == 'BUY' else trigger_down) else 0
+    score = min(100, score)
 
     distance = max(abs(next_zone - last), 0)
     candles = max(1, min(96, math.ceil(distance / max(a, 1e-12))))
-    score += 15 if distance <= a * 6 else 5
     score = min(100, score)
-    status = 'SIGNAL READY' if score >= 65 else 'WATCHING'
     return {
-        'direction': direction,
-        'score': score,
-        'status': status,
-        'reasons': reasons,
-        'structure': structure,
-        'trigger_text': trigger_text,
-        'trigger_price': trigger_price,
-        'entry_zone': entry_zone,
-        'stop_loss': stop_loss,
-        'take_profit_1': tp1,
-        'take_profit_2': tp2,
-        'next_zone': next_zone,
-        'next_zone_type': next_zone_type,
-        'candles_to_next_zone': candles,
+        'direction': direction, 'score': score, 'status': status, 'reasons': reasons,
+        'structure': structure, 'trigger_text': (
+            f'{trigger_timeframe} close above {trigger_price:.8f}' if direction == 'BUY'
+            else f'{trigger_timeframe} close below {trigger_price:.8f}'
+        ), 'trigger_price': trigger_price, 'entry_zone': entry_zone,
+        'stop_loss': stop_loss, 'take_profit_1': tp1, 'take_profit_2': tp2,
+        'next_zone': next_zone, 'next_zone_type': next_zone_type,
+        'zone_type': zone_type, 'candles_to_next_zone': candles,
         'estimated_minutes_to_next_zone': candles * tf_minutes,
-        'distance_to_next_zone': distance,
-        'atr': a,
-        'last': last,
-        'support': support,
-        'resistance': resistance,
-        'rsi': t15['rsi'],
-        'trend': t15['trend'],
-        'trend_scores': trend_scores,
+        'distance_to_next_zone': distance, 'atr': a, 'last': last,
+        'support': t['support'], 'resistance': t['resistance'], 'rsi': t['rsi'],
+        'trend': t['trend'], 'trend_scores': trend_scores, 'context_trends': context_trends
     }
 
-
 def backtest(rows, lookahead=12):
-    """Simple historical validation of the rule set. This is historical, not a guarantee."""
-    if len(rows) < 180:
-        return {'samples': 0, 'wins': 0, 'losses': 0, 'win_rate': None}
-    wins = losses = 0
-    for i in range(100, len(rows) - lookahead, 6):
+    """Historical check of the same trigger concept used by the scanner.
+
+    This measures directional follow-through after a confirmed 5-candle breakout/
+    breakdown, using ATR as the 1R unit. It is validation data, not a prediction.
+    """
+    if len(rows) < 220:
+        return {'samples':0, 'wins':0, 'losses':0, 'win_rate':None, 'rule':'trigger breakout + ATR target/stop'}
+
+    wins = losses = samples = 0
+    for i in range(120, len(rows) - lookahead - 1):
         part = rows[:i + 1]
         info = trend_info(part)
-        entry = part[-1]['close']
-        target = max(atr(part), 1e-12)
-        if info['trend'] == 'Bullish':
-            hit_win = any(r['high'] >= entry + target for r in rows[i + 1:i + 1 + lookahead])
-            hit_loss = any(r['low'] <= entry - target for r in rows[i + 1:i + 1 + lookahead])
-        elif info['trend'] == 'Bearish':
-            hit_win = any(r['low'] <= entry - target for r in rows[i + 1:i + 1 + lookahead])
-            hit_loss = any(r['high'] >= entry + target for r in rows[i + 1:i + 1 + lookahead])
-        else:
+        a = max(atr(part), 1e-12)
+        recent = part[-12:]
+        prev5_high = max(r['high'] for r in part[-6:-1])
+        prev5_low = min(r['low'] for r in part[-6:-1])
+        structure = structure_label(part)
+        direction = None
+        if info['trend'] == 'Bullish' and info['rsi'] >= 50 and 'bullish' in structure.lower() and part[-1]['close'] > prev5_high:
+            direction = 'BUY'
+        elif info['trend'] == 'Bearish' and info['rsi'] <= 50 and 'bearish' in structure.lower() and part[-1]['close'] < prev5_low:
+            direction = 'SELL'
+        if not direction:
             continue
-        if hit_win and not hit_loss:
-            wins += 1
-        elif hit_loss and not hit_win:
-            losses += 1
-    n = wins + losses
-    return {'samples': n, 'wins': wins, 'losses': losses, 'win_rate': round(wins / n * 100, 1) if n else None}
 
+        entry = part[-1]['close']
+        if direction == 'BUY':
+            stop = min(r['low'] for r in recent[:-1]) - a * 0.15
+            risk = max(entry - stop, a * 0.15)
+            target = entry + risk
+            stop_price = entry - risk
+            hit = None
+            for r in rows[i+1:i+1+lookahead]:
+                if r['low'] <= stop_price and r['high'] >= target:
+                    hit = 'loss'  # conservative: both touched in same candle
+                    break
+                if r['high'] >= target:
+                    hit = 'win'; break
+                if r['low'] <= stop_price:
+                    hit = 'loss'; break
+        else:
+            stop = max(r['high'] for r in recent[:-1]) + a * 0.15
+            risk = max(stop - entry, a * 0.15)
+            target = entry - risk
+            stop_price = entry + risk
+            hit = None
+            for r in rows[i+1:i+1+lookahead]:
+                if r['high'] >= stop_price and r['low'] <= target:
+                    hit = 'loss'
+                    break
+                if r['low'] <= target:
+                    hit = 'win'; break
+                if r['high'] >= stop_price:
+                    hit = 'loss'; break
+
+        if hit:
+            samples += 1
+            if hit == 'win': wins += 1
+            else: losses += 1
+
+    return {
+        'samples': samples, 'wins': wins, 'losses': losses,
+        'win_rate': round((wins / samples) * 100, 1) if samples else None,
+        'rule':'trigger breakout + structure + RSI + ATR-based 1R validation'
+    }
 
 def utc_iso(timestamp=None):
     return datetime.fromtimestamp(timestamp or time.time(), tz=timezone.utc).isoformat()
