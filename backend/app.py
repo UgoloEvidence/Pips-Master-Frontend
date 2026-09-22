@@ -499,7 +499,7 @@ def my_feedback(req: Request):
 
 
 def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
-    trigger_timeframe = trigger_timeframe if trigger_timeframe in {'1m','5m','15m','30m','1h'} else '15m'
+    trigger_timeframe = trigger_timeframe if trigger_timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m'
     frames = {tf: fetch(symbol, tf) for tf in ('15m','30m','1h','4h','1d')}
     trigger_rows = fetch(symbol, trigger_timeframe)
     setup = analyze_setup(trigger_rows, frames, trigger_timeframe)
@@ -530,6 +530,22 @@ def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
     }
 
 
+@app.get('/api/health')
+def health():
+    return {'ok':True,'service':'Pips Master Academy API','market_data':'Yahoo Finance chart feed','timeframes':['1m','5m','15m','1h','4h','1d'],'updated_at':utc_iso()}
+
+
+@app.get('/api/market-data/test')
+def market_data_test(symbol: str='EURUSD', timeframe: str='15m'):
+    if timeframe not in {'1m','5m','15m','1h','4h','1d'}:
+        raise HTTPException(400,'Unsupported timeframe. Use 1m, 5m, 15m, 1h, 4h or 1d.')
+    try:
+        rows=fetch(symbol,timeframe)
+        return {'ok':True,'symbol':norm_symbol(symbol),'timeframe':timeframe,'candles':len(rows),'last_close':rows[-1]['close'],'updated_at':utc_iso()}
+    except Exception as ex:
+        raise HTTPException(503,f'Market data test failed: {ex}')
+
+
 @app.get('/api/signals/scan')
 def scan(market: str='Forex', symbols: str='EURUSD', timeframe: str='15m'):
     requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:20]
@@ -543,7 +559,7 @@ def scan(market: str='Forex', symbols: str='EURUSD', timeframe: str='15m'):
     opportunities.sort(key=lambda x:(0 if x['direction']!='NO TRADE' else 1, x['estimated_minutes_to_next_zone'] if x['estimated_minutes_to_next_zone'] is not None else 10**9, -(x['setup_strength'] or 0)))
     return {
         'closest':opportunities[0] if opportunities else None,
-        'timeframe': timeframe if timeframe in {'1m','5m','15m','30m','1h'} else '15m',
+        'timeframe': timeframe if timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m',
         'opportunities':opportunities,'errors':errors,'market':market,'symbols':requested,
         'message':'Verified candle data loaded.' if opportunities else 'No verified candle data was returned; no signal is being invented.',
         'updated_at':utc_iso()

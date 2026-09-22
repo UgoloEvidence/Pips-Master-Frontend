@@ -14,7 +14,8 @@ YAHOO_MAP = {
     'BTCUSD':'BTC-USD','ETHUSD':'ETH-USD','XRPUSD':'XRP-USD','SOLUSD':'SOL-USD','BNBUSD':'BNB-USD','ADAUSD':'ADA-USD','LTCUSD':'LTC-USD'
 }
 INTERVALS = {'1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'1h','1d':'1d'}
-RANGES_DAYS = {'1m':7,'5m':60,'15m':7,'30m':30,'1h':90,'1d':900}
+RANGES_DAYS = {'1m':7,'5m':60,'15m':60,'30m':60,'1h':180,'1d':1825}
+RANGES = {'1m':'7d','5m':'60d','15m':'60d','30m':'60d','1h':'180d','1d':'5y'}
 TIMEFRAME_MINUTES = {'1m':1,'5m':5,'15m':15,'30m':30,'1h':60,'4h':240,'1d':1440}
 CACHE = {}
 
@@ -88,9 +89,10 @@ def fetch(symbol: str, interval: str):
     if cached and now - cached[0] < 20:
         return cached[1]
 
+    # Yahoo's chart endpoint is more reliable on Render when using a bounded
+    # range instead of calculated Unix periods, especially for intraday data.
     params = urllib.parse.urlencode({
-        'period1': int(now) - RANGES_DAYS[interval] * 86400,
-        'period2': int(now),
+        'range': RANGES[interval],
         'interval': INTERVALS[interval],
         'events': 'history',
         'includeAdjustedClose': 'true',
@@ -100,21 +102,28 @@ def fetch(symbol: str, interval: str):
     for host in ('query1.finance.yahoo.com', 'query2.finance.yahoo.com'):
         url = f'https://{host}/v8/finance/chart/{urllib.parse.quote(ys, safe="")}?{params}'
         req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 PipsMasterAcademy/2.0',
-            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36 PMA/2.1',
+            'Accept': 'application/json,text/plain,*/*',
+            'Accept-Encoding': 'identity',
+            'Connection': 'close',
         })
         try:
-            with urllib.request.urlopen(req, timeout=12) as response:
-                raw = json.loads(response.read().decode())
+            with urllib.request.urlopen(req, timeout=18) as response:
+                payload = response.read().decode('utf-8', errors='replace')
+                raw = json.loads(payload)
             result = ((raw.get('chart') or {}).get('result') or []) if raw else []
+            chart_error = ((raw.get('chart') or {}).get('error') or {}) if raw else {}
             if result:
                 break
-            last_error = ValueError(f'No verified response for {symbol} {interval}')
+            last_error = ValueError(chart_error.get('description') or f'No verified response for {symbol} {interval}')
         except Exception as exc:
             last_error = exc
 
     result = ((raw.get('chart') or {}).get('result') or []) if raw else []
     if not result:
+        stale = CACHE.get(key)
+        if stale and stale[1]:
+            return stale[1]
         raise ValueError(f'No verified market response for {symbol} {interval}: {last_error}')
 
     res = result[0]
