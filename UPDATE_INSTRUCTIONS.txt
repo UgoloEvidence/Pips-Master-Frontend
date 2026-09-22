@@ -1,13 +1,26 @@
-PMA targeted update: Trading History analytics, faster Day Trade switching, and email verification.
+PMA AUTHENTICATION FIX
 
-EMAIL VERIFICATION SETUP (required for new registrations):
-Use either Resend or SMTP on the backend.
+Scope of this update: authentication/login and email verification only.
 
-Resend:
+Changes:
+- Existing accounts are NOT required to sign up again.
+- Every explicit login (including administrator login) requires a fresh 6-digit email verification code.
+- Password is checked first; only the correct account can request a code.
+- Verification is completed through /api/auth/verify-email and returns a signed session token.
+- Signup sends the first verification code.
+- Resend verification is available.
+- Existing accounts remain in the database with their existing PMA ID, role, password and account data.
+- Admin role is preserved; an admin account does not become a normal user.
+- Page reload/session restoration remains token-based and does not require signup.
+
+IMPORTANT DEPLOYMENT SETUP:
+Configure email delivery on the backend (Render environment variables) before testing login:
+
+Resend option:
 PMA_EMAIL_FROM=verified@yourdomain.com
 RESEND_API_KEY=your_resend_api_key
 
-OR SMTP:
+OR SMTP option:
 PMA_EMAIL_FROM=your_verified_sender@example.com
 SMTP_HOST=smtp.example.com
 SMTP_PORT=587
@@ -17,4 +30,4 @@ SMTP_TLS=1
 
 PMA_EMAIL_VERIFY_TTL=900
 
-Existing accounts are treated as already verified during migration so the update does not lock existing users out. New accounts must enter the 6-digit code emailed to them before login.
+If email delivery is not configured, login will now show a specific configuration error instead of the generic "Please try again in a moment." message.

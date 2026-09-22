@@ -415,13 +415,18 @@ def verify_email(x: EmailVerification):
     if len(code)!=6: raise HTTPException(400,'Enter the 6-digit verification code.')
     c=db(); row=c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(email,)).fetchone()
     if not row: c.close(); raise HTTPException(404,'No account was found for that email.')
-    if int(row['email_verified'] or 0): c.close(); return {'ok':True,'verified':True,'message':'Email is already verified.'}
     if int(row['verification_attempts'] or 0)>=5: c.close(); raise HTTPException(429,'Too many incorrect attempts. Request a new code.')
     if int(row['verification_expires'] or 0)<int(time.time()): c.close(); raise HTTPException(400,'That verification code has expired. Request a new code.')
     if not hmac.compare_digest(_verification_hash(email,code),row['verification_code_hash'] or ''):
         c.execute('UPDATE users SET verification_attempts=COALESCE(verification_attempts,0)+1 WHERE id=?',(row['id'],)); c.commit(); c.close(); raise HTTPException(400,'Incorrect verification code.')
-    c.execute("UPDATE users SET email_verified=1,verification_code_hash='',verification_expires=0,verification_attempts=0 WHERE id=?",(row['id'],)); c.commit(); c.close()
-    return {'ok':True,'verified':True,'message':'Email verified successfully. You can now log in.'}
+    now=int(time.time())
+    c.execute("UPDATE users SET email_verified=1,verification_code_hash='',verification_expires=0,verification_attempts=0,last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?",(now,row['id']))
+    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login_verified',now))
+    push_notice(c,row['username'],'Email verified','Your email was verified and your PMA session was signed in.','security')
+    c.commit()
+    fresh=c.execute('SELECT * FROM users WHERE id=?',(row['id'],)).fetchone()
+    c.close()
+    return {'ok':True,'verified':True,'message':'Email verified successfully. You are now signed in.','user':user_out(fresh),'token':make_token(fresh['id'])}
 
 
 @app.post('/api/auth/resend-verification')
@@ -470,14 +475,16 @@ def signup(x: Signup):
 @app.post('/api/auth/login')
 def login(x: Login):
     c = db(); row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(str(x.email),)).fetchone()
-    if not row or not verify_password(x.password,row['password']): c.close(); raise HTTPException(401,'Email or password is incorrect.')
-    if not int(row['email_verified'] or 0): c.close(); raise HTTPException(403,'EMAIL_NOT_VERIFIED')
-    now = int(time.time())
-    c.execute('UPDATE users SET last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,row['id']))
-    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
-    push_notice(c,row['username'],'New login','Your account was signed in successfully.','security'); c.commit(); c.close()
-    token=make_token(row['id'])
-    return {'user':user_out(row),'token':token}
+    if not row or not verify_password(x.password,row['password']):
+        c.close(); raise HTTPException(401,'Email or password is incorrect.')
+    # Require a fresh email verification code at each explicit login. This applies to members and administrators.
+    try:
+        _issue_verification(c,row)
+        c.commit(); c.close()
+    except Exception as ex:
+        c.rollback(); c.close()
+        raise HTTPException(503,'Email verification could not be sent. Configure RESEND_API_KEY or SMTP settings on the backend, then try again.')
+    raise HTTPException(403,'EMAIL_VERIFY_REQUIRED')
 
 
 @app.post('/api/auth/logout')
