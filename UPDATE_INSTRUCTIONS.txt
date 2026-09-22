@@ -1,23 +1,22 @@
-PMA UPDATE — LOGIN, MARKET SPEED, COMMUNITY, TRADING HISTORY
+PMA UPDATE — FAST VERIFIED MARKETS, SCANNER, DAY TRADE, COMMUNITY, HISTORY
 
-This build updates the existing Pips Master Academy project.
+This build is based on the latest PMA LOGIN_MARKETS_COMMUNITY_HISTORY_FAST build and keeps the existing community/admin behavior.
 
-Main fixes:
-- Login no longer displays "Connecting to PMA".
-- Login timeout is more tolerant of backend wake-up time.
-- Multiple devices remain independently logged in; one device does not invalidate another.
-- Scanner requests the selected symbol first so switching timeframe/symbol can render the MTF context without waiting for an 8-symbol batch.
-- Backend market-data request/cache timing was increased to avoid premature frontend timeouts.
-- Day Trade keeps cached verified snapshots and prefetches other market categories in the background.
-- Indices, Metals, Crypto and Commodities use the same verified TradingView/Yahoo fallback path; no fake prices are generated.
-- Added full Trading History section to the hamburger menu.
-- Trading History reads backend trade_history and signal_history data.
-- History retention defaults to 7 days and the administrator can turn automatic 7-day deletion off/on.
-- Community shows member list, community bio, reply-to messages, media, member/admin delete controls, and 7-day disappearing-message setting.
-- Administrator cannot leave the community.
-- Regular approved members can leave the community; unapproved members can request access.
-- Admin can approve/remove/suspend/restore members and change community name, bio, picture and disappearing-message setting.
+Main changes:
+- Scanner trigger timeframe now defaults to 15m. Users can still choose 1m, 5m, 15m, 1h, 4h or 1d.
+- Scanner loads the exact selected symbol first. The multi-symbol watchlist refresh runs separately so another slow market cannot block the selected one.
+- Scanner cache keys now include market + symbol + timeframe, preventing stale data from another pair/category being shown.
+- Added a verified Yahoo OHLC fallback snapshot engine for Forex, Indices, Metals, Crypto and Commodities when TradingView scanner data is unavailable.
+- Yahoo provider requests use parallel provider hosts to reduce timeout latency.
+- Live fallback no longer runs an expensive historical backtest on every screen refresh.
+- Day Trade loads the selected market first, then refreshes the broader six-symbol watchlist in the background.
+- Switching Day Trade market or timeframe will not allow an older request to overwrite the new selection.
+- Trading History loads cached verified history immediately when available and fetches trade/signal history independently so one failed endpoint does not blank the whole section.
+- Community keeps the existing backend-persistent chat, admin approval, admin moderation, media, disappearing-message controls and admin-no-leave rule.
+- Regular approved users now have an explicit Leave community button; the admin does not.
+- Community member list is visible to approved users. Clicking a member inserts @username for a mention/highlight-style message.
+- Reply-to messages are now actually sent with reply_to_id instead of only being shown in the UI.
+- Community status/messages/member data use cached-first rendering so returning to the community does not start from a blank screen.
+- History retention remains 7 days by default and the administrator can turn automatic deletion off/on.
 
-Important:
-- This package does not invent market prices or historical trades.
-- Full live provider speed still depends on TradingView/Yahoo and Render response time. The app now caches verified results and avoids failing the UI too early.
+No fake prices, fake candles, fake trade outcomes or fabricated history are added. External provider latency can still vary, but unrelated markets are no longer allowed to block the selected view.

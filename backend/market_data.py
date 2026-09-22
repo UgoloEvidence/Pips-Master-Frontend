@@ -104,26 +104,29 @@ def fetch(symbol: str, interval: str):
     })
     raw = None
     last_error = None
-    for host in ('query1.finance.yahoo.com', 'query2.finance.yahoo.com'):
+    def yahoo_call(host):
         url = f'https://{host}/v8/finance/chart/{urllib.parse.quote(ys, safe="")}?{params}'
         req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36 PMA/2.1',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36 PMA/3.0',
             'Accept': 'application/json,text/plain,*/*',
-            'Accept-Encoding': 'identity',
-            'Referer': 'https://finance.yahoo.com/',
+            'Accept-Encoding': 'identity', 'Referer': 'https://finance.yahoo.com/',
             'Connection': 'close',
         })
-        try:
-            with urllib.request.urlopen(req, timeout=5) as response:
-                payload = response.read().decode('utf-8', errors='replace')
-                raw = json.loads(payload)
-            result = ((raw.get('chart') or {}).get('result') or []) if raw else []
-            chart_error = ((raw.get('chart') or {}).get('error') or {}) if raw else {}
-            if result:
-                break
-            last_error = ValueError(chart_error.get('description') or f'No verified response for {symbol} {interval}')
-        except Exception as exc:
-            last_error = exc
+        with urllib.request.urlopen(req, timeout=3.5) as response:
+            return json.loads(response.read().decode('utf-8', errors='replace'))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(yahoo_call, host) for host in ('query1.finance.yahoo.com','query2.finance.yahoo.com')]
+        for job in as_completed(jobs):
+            try:
+                candidate = job.result()
+                result = ((candidate.get('chart') or {}).get('result') or []) if candidate else []
+                if result:
+                    raw = candidate
+                    break
+                err = ((candidate.get('chart') or {}).get('error') or {}) if candidate else {}
+                last_error = ValueError(err.get('description') or f'No verified response for {symbol} {interval}')
+            except Exception as exc:
+                last_error = exc
 
     result = ((raw.get('chart') or {}).get('result') or []) if raw else []
     if not result:
@@ -176,6 +179,49 @@ def _tv_tickers(symbol, market='Forex'):
         return [p + s for p in TV_TICKER_PREFIXES['Crypto']]
     return [p + s for p in TV_TICKER_PREFIXES.get(market, ['OANDA:', 'FX_IDC:'])]
 
+
+
+def yahoo_verified_snapshots(symbol: str, timeframes=None):
+    """Build the same lightweight MTF snapshot shape used by the TradingView path,
+    using verified Yahoo OHLC candles when the TradingView scanner is unavailable.
+    All requested frames are fetched concurrently and cached by fetch()."""
+    frames = tuple(dict.fromkeys(timeframes or ('15m','30m','1h','4h','1d')))
+    # 4h is derived from the already-verified 1h candles, so fetch 1h once.
+    needed = tuple(dict.fromkeys(tuple(tf for tf in frames if tf != '4h') + (('1h',) if '4h' in frames else ())))
+    # Preserve every requested frame except derived 4h.
+    direct = tuple(tf for tf in needed if tf != '4h')
+    fetched = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(direct))) as pool:
+        jobs = {pool.submit(fetch, symbol, tf): tf for tf in direct}
+        for job in as_completed(jobs):
+            tf = jobs[job]
+            fetched[tf] = job.result()
+    if '4h' in frames:
+        fetched['4h'] = aggregate_4h(fetched['1h'])
+    out = {}
+    for tf in frames:
+        rows = fetched[tf]
+        info = trend_info(rows)
+        last = rows[-1]
+        trend = info['trend']
+        rsi_v = info['rsi']
+        # This is a derived technical-bias value from verified candles, not a
+        # fabricated TradingView rating and not a probability of winning.
+        rec = 0.55 if trend == 'Bullish' else (-0.55 if trend == 'Bearish' else 0.0)
+        if trend == 'Bullish' and rsi_v < 52: rec = 0.20
+        if trend == 'Bearish' and rsi_v > 48: rec = -0.20
+        out[tf] = {
+            'ticker': yahoo_symbol(symbol) or norm_symbol(symbol),
+            'open': float(last['open']), 'high': float(last['high']),
+            'low': float(last['low']), 'close': float(last['close']),
+            'rsi': float(info['rsi']), 'ema20': float(info['ema20']),
+            'ema50': float(info['ema50']), 'ema100': float(info['ema100']),
+            'atr': float(atr(rows)), 'recommend': rec,
+            's1': float(info['support']), 'r1': float(info['resistance']),
+            'change': ((last['close']-rows[-2]['close'])/rows[-2]['close']*100) if len(rows)>1 and rows[-2]['close'] else 0.0,
+            'provider': 'Yahoo Finance verified OHLC',
+        }
+    return out
 
 def _tv_scan_many(symbols, market='Forex', timeframes=None):
     """Fetch one fresh TradingView snapshot for several symbols in a single request.
