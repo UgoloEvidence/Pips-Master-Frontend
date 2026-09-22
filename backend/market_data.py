@@ -18,6 +18,7 @@ RANGES_DAYS = {'1m':7,'5m':60,'15m':60,'30m':60,'1h':180,'1d':1825}
 RANGES = {'1m':'7d','5m':'60d','15m':'60d','30m':'60d','1h':'180d','1d':'5y'}
 TIMEFRAME_MINUTES = {'1m':1,'5m':5,'15m':15,'30m':30,'1h':60,'4h':240,'1d':1440}
 CACHE = {}
+CACHE_TTL = 120
 
 
 def norm_symbol(symbol: str) -> str:
@@ -73,7 +74,7 @@ def fetch(symbol: str, interval: str):
         key = (symbol, interval)
         now = time.time()
         cached = CACHE.get(key)
-        if cached and now - cached[0] < 20:
+        if cached and now - cached[0] < CACHE_TTL:
             return cached[1]
         base = fetch(symbol, '1h')
         rows = aggregate_4h(base)
@@ -86,7 +87,7 @@ def fetch(symbol: str, interval: str):
     key = (symbol, interval)
     now = time.time()
     cached = CACHE.get(key)
-    if cached and now - cached[0] < 20:
+    if cached and now - cached[0] < CACHE_TTL:
         return cached[1]
 
     # Yahoo's chart endpoint is more reliable on Render when using a bounded
@@ -105,6 +106,7 @@ def fetch(symbol: str, interval: str):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36 PMA/2.1',
             'Accept': 'application/json,text/plain,*/*',
             'Accept-Encoding': 'identity',
+            'Referer': 'https://finance.yahoo.com/',
             'Connection': 'close',
         })
         try:
