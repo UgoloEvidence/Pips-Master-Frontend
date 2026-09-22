@@ -1,22 +1,20 @@
-PMA UPDATE — FAST VERIFIED MARKETS, SCANNER, DAY TRADE, COMMUNITY, HISTORY
+PMA targeted update: Trading History analytics, faster Day Trade switching, and email verification.
 
-This build is based on the latest PMA LOGIN_MARKETS_COMMUNITY_HISTORY_FAST build and keeps the existing community/admin behavior.
+EMAIL VERIFICATION SETUP (required for new registrations):
+Use either Resend or SMTP on the backend.
 
-Main changes:
-- Scanner trigger timeframe now defaults to 15m. Users can still choose 1m, 5m, 15m, 1h, 4h or 1d.
-- Scanner loads the exact selected symbol first. The multi-symbol watchlist refresh runs separately so another slow market cannot block the selected one.
-- Scanner cache keys now include market + symbol + timeframe, preventing stale data from another pair/category being shown.
-- Added a verified Yahoo OHLC fallback snapshot engine for Forex, Indices, Metals, Crypto and Commodities when TradingView scanner data is unavailable.
-- Yahoo provider requests use parallel provider hosts to reduce timeout latency.
-- Live fallback no longer runs an expensive historical backtest on every screen refresh.
-- Day Trade loads the selected market first, then refreshes the broader six-symbol watchlist in the background.
-- Switching Day Trade market or timeframe will not allow an older request to overwrite the new selection.
-- Trading History loads cached verified history immediately when available and fetches trade/signal history independently so one failed endpoint does not blank the whole section.
-- Community keeps the existing backend-persistent chat, admin approval, admin moderation, media, disappearing-message controls and admin-no-leave rule.
-- Regular approved users now have an explicit Leave community button; the admin does not.
-- Community member list is visible to approved users. Clicking a member inserts @username for a mention/highlight-style message.
-- Reply-to messages are now actually sent with reply_to_id instead of only being shown in the UI.
-- Community status/messages/member data use cached-first rendering so returning to the community does not start from a blank screen.
-- History retention remains 7 days by default and the administrator can turn automatic deletion off/on.
+Resend:
+PMA_EMAIL_FROM=verified@yourdomain.com
+RESEND_API_KEY=your_resend_api_key
 
-No fake prices, fake candles, fake trade outcomes or fabricated history are added. External provider latency can still vary, but unrelated markets are no longer allowed to block the selected view.
+OR SMTP:
+PMA_EMAIL_FROM=your_verified_sender@example.com
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USER=your_smtp_username
+SMTP_PASSWORD=your_smtp_password
+SMTP_TLS=1
+
+PMA_EMAIL_VERIFY_TTL=900
+
+Existing accounts are treated as already verified during migration so the update does not lock existing users out. New accounts must enter the 6-digit code emailed to them before login.
