@@ -319,6 +319,56 @@ def _snapshot_trend(s):
     return 'Neutral'
 
 
+def candle_confirmation(symbol, timeframe):
+    """Use verified historical candles when available to confirm the sniper trigger.
+    Returns the last/previous candle relationship without pretending a one-candle
+    TradingView snapshot contains historical candle data.
+    """
+    try:
+        rows = fetch(symbol, timeframe)
+        if len(rows) < 3:
+            return {'available':False,'reason':'Not enough verified candles'}
+        prev, cur = rows[-2], rows[-1]
+        prev_bull = prev['close'] > prev['open']
+        prev_bear = prev['close'] < prev['open']
+        cur_bull = cur['close'] > cur['open']
+        cur_bear = cur['close'] < cur['open']
+        bullish_engulfing = (prev_bear and cur_bull and cur['open'] <= prev['close'] and cur['close'] >= prev['open'])
+        bearish_engulfing = (prev_bull and cur_bear and cur['open'] >= prev['close'] and cur['close'] <= prev['open'])
+        cur_range=max(cur['high']-cur['low'],1e-12)
+        lower_wick=min(cur['open'],cur['close'])-cur['low']
+        upper_wick=cur['high']-max(cur['open'],cur['close'])
+        bullish_rejection=lower_wick >= cur_range*0.35 and cur['close'] >= cur['open']
+        bearish_rejection=upper_wick >= cur_range*0.35 and cur['close'] <= cur['open']
+        p2=rows[-3]
+        recent=rows[-30:]
+        range_high=max(r['high'] for r in recent); range_low=min(r['low'] for r in recent); midpoint=(range_high+range_low)/2
+        bullish_fvg=cur['low'] > p2['high']
+        bearish_fvg=cur['high'] < p2['low']
+        bullish_sweep=cur['low'] < prev['low'] and cur['close'] > prev['low']
+        bearish_sweep=cur['high'] > prev['high'] and cur['close'] < prev['high']
+        displacement_up=cur['close']>cur['open'] and (cur['close']-cur['open']) >= cur_range*0.55
+        displacement_down=cur['close']<cur['open'] and (cur['open']-cur['close']) >= cur_range*0.55
+        bullish_mss=bullish_sweep and cur['close']>max(r['high'] for r in rows[-6:-1])
+        bearish_mss=bearish_sweep and cur['close']<min(r['low'] for r in rows[-6:-1])
+        avg_vol=mean([r.get('volume',0) for r in recent[:-1]]) if recent[:-1] else 0
+        vsa_bull=bool(avg_vol and cur.get('volume',0)>avg_vol*1.25 and cur_bull and lower_wick>upper_wick)
+        vsa_bear=bool(avg_vol and cur.get('volume',0)>avg_vol*1.25 and cur_bear and upper_wick>lower_wick)
+        order_block_bullish=any(r['close']<r['open'] for r in rows[-5:-1]) and displacement_up
+        order_block_bearish=any(r['close']>r['open'] for r in rows[-5:-1]) and displacement_down
+        wyckoff_spring=bullish_sweep and cur_bull
+        wyckoff_upthrust=bearish_sweep and cur_bear
+        return {'available':True,'bullish_engulfing':bullish_engulfing,'bearish_engulfing':bearish_engulfing,
+                'bullish_rejection':bullish_rejection,'bearish_rejection':bearish_rejection,
+                'bullish_fvg':bullish_fvg,'bearish_fvg':bearish_fvg,'bullish_sweep':bullish_sweep,'bearish_sweep':bearish_sweep,
+                'bullish_mss':bullish_mss,'bearish_mss':bearish_mss,'displacement_up':displacement_up,'displacement_down':displacement_down,
+                'order_block_bullish':order_block_bullish,'order_block_bearish':order_block_bearish,'wyckoff_spring':wyckoff_spring,'wyckoff_upthrust':wyckoff_upthrust,
+                'premium_discount':'discount' if cur['close']<=midpoint else 'premium','vsa_bull':vsa_bull,'vsa_bear':vsa_bear,
+                'previous_open':prev['open'],'previous_close':prev['close'],'current_open':cur['open'],'current_close':cur['close']}
+    except Exception as exc:
+        return {'available':False,'reason':str(exc)}
+
+
 def _tv_setup(symbol, market, trigger_tf, snaps):
     """Create a forecast-first setup instead of chasing price at a zone.
 
@@ -367,6 +417,11 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
     last_low = trigger.get('low') or close
     bullish_rejection = (s1 is not None and demand_reached and close > s1 and last_low <= s1 + zone_tol and close >= last_open and rec >= 0.25)
     bearish_rejection = (r1 is not None and supply_reached and close < r1 and last_high >= r1 - zone_tol and close <= last_open and rec <= -0.25)
+    candle_conf = {'available':False}
+    if bullish_rejection or bearish_rejection:
+        candle_conf = candle_confirmation(symbol, trigger_tf)
+    bullish_sniper = bullish_rejection and candle_conf.get('available') and candle_conf.get('bullish_engulfing')
+    bearish_sniper = bearish_rejection and candle_conf.get('available') and candle_conf.get('bearish_engulfing')
 
     # Opposing-zone protection: once an uptrend reaches supply, do not issue BUY;
     # once a downtrend reaches demand, do not issue SELL. Wait for a fresh setup.
@@ -391,11 +446,14 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
         if supply_broken:
             direction='NO TRADE'; status='FORECAST INVALIDATED'; entry=None; stop=None; tp1=None; tp2=None
             reasons=['Bullish forecast invalidated: price has already broken the projected supply/resistance zone','No BUY is issued after an extended move; wait for a fresh pullback structure']
-        elif bullish_rejection:
+        elif bullish_sniper:
             status='SIGNAL READY'; entry=close; stop=(s1-atr_v*0.20) if s1 is not None else close-atr_v*0.20
             risk=max(entry-stop,atr_v*0.20); tp1=r1 if r1 is not None and r1>entry else entry+risk; tp2=tp1+risk
-            reasons.append('Demand was reached and the trigger candle rejected the zone; BUY confirmation is present')
-        trigger_text=f'WAIT for pullback into demand near {trigger_price:.8f}; require bullish rejection before BUY'
+            reasons.append('Demand was reached and the verified trigger candle supplied sniper confirmation (rejection/engulfing)')
+        trigger_text=f'WAIT for pullback into demand near {trigger_price:.8f}; require rejection + bullish engulfing/sniper confirmation before BUY'
+        if bullish_rejection and not bullish_sniper:
+            status='WAITING FOR CONFIRMATION'
+            reasons.append('Zone rejection detected, but the verified candle confirmation is not strong enough for the sniper entry yet')
     elif sell_context:
         direction='SELL'; status='FORECAST'
         trigger_price=r1 if r1 is not None else close+atr_v
@@ -409,11 +467,14 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
         if demand_broken:
             direction='NO TRADE'; status='FORECAST INVALIDATED'; entry=None; stop=None; tp1=None; tp2=None
             reasons=['Bearish forecast invalidated: price has already broken the projected demand/support zone','No SELL is issued after an extended move; wait for a fresh pullback structure']
-        elif bearish_rejection:
+        elif bearish_sniper:
             status='SIGNAL READY'; entry=close; stop=(r1+atr_v*0.20) if r1 is not None else close+atr_v*0.20
             risk=max(stop-entry,atr_v*0.20); tp1=s1 if s1 is not None and s1<entry else entry-risk; tp2=tp1-risk
-            reasons.append('Supply was reached and the trigger candle rejected the zone; SELL confirmation is present')
-        trigger_text=f'WAIT for pullback into supply near {trigger_price:.8f}; require bearish rejection before SELL'
+            reasons.append('Supply was reached and the verified trigger candle supplied sniper confirmation (rejection/engulfing)')
+        trigger_text=f'WAIT for pullback into supply near {trigger_price:.8f}; require rejection + bearish engulfing/sniper confirmation before SELL'
+        if bearish_rejection and not bearish_sniper:
+            status='WAITING FOR CONFIRMATION'
+            reasons.append('Zone rejection detected, but the verified candle confirmation is not strong enough for the sniper entry yet')
     elif trend == 'Bullish' and bull >= 3:
         direction='NO TRADE'; status='WAITING FOR PULLBACK'; next_zone=s1 if s1 is not None else close-atr_v; entry=next_zone; zone_type='Demand pullback required'
         reasons=['Bullish trend identified across multiple timeframes','No BUY at current price: wait for a demand pullback and rejection']
@@ -468,7 +529,22 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
             'candles_to_next_zone':candles,'estimated_minutes_to_next_zone':candles*tf_minutes,
             'distance_to_next_zone':distance,'atr':atr_v,'last':close,'support':s1,'resistance':r1,'rsi':rsi_v,
             'trend':trend,'trend_scores':list(context.values()),'context_trends':context,
-            'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'Live TradingView snapshot; no historical result is presented as a backtest'}}
+            'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'Live TradingView snapshot; no historical result is presented as a backtest'},
+            'available_strategies':['Supply/Demand','Order Blocks / IOF retest','Fair Value Gaps','Premium / Discount','Liquidity Sweeps','MSS / CHoCH','Wyckoff spring/upthrust','VSA volume confirmation','Breakout / Retest'],
+            'strategy_state': 'SNIPER CONFIRMED' if (bullish_sniper or bearish_sniper) else ('ZONE REJECTION' if (bullish_rejection or bearish_rejection) else 'WAITING'),
+            'strategy_confluence': [x for x in [
+                'Supply/Demand pullback' if (demand_reached or supply_reached) else None,
+                'Premium/Discount: '+str(candle_conf.get('premium_discount')) if candle_conf.get('available') else None,
+                'Liquidity sweep' if (candle_conf.get('bullish_sweep') or candle_conf.get('bearish_sweep')) else None,
+                'MSS / structure shift' if (candle_conf.get('bullish_mss') or candle_conf.get('bearish_mss')) else None,
+                'Fair Value Gap / Imbalance' if (candle_conf.get('bullish_fvg') or candle_conf.get('bearish_fvg')) else None,
+                'Order Block / IOF retest context' if (candle_conf.get('order_block_bullish') or candle_conf.get('order_block_bearish')) else None,
+                'Wyckoff spring/upthrust context' if (candle_conf.get('wyckoff_spring') or candle_conf.get('wyckoff_upthrust')) else None,
+                'Displacement' if (candle_conf.get('displacement_up') or candle_conf.get('displacement_down')) else None,
+                'Candle rejection' if (bullish_rejection or bearish_rejection) else None,
+                'Bullish/Bearish engulfing confirmation' if (candle_conf.get('bullish_engulfing') or candle_conf.get('bearish_engulfing')) else None,
+                'VSA volume confirmation' if (candle_conf.get('vsa_bull') or candle_conf.get('vsa_bear')) else None,
+            ] if x]}
 
 
 def ema(values, n):

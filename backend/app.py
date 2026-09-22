@@ -187,6 +187,11 @@ def db():
     c.execute('''CREATE TABLE IF NOT EXISTS activity_log(
         id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, event_type TEXT NOT NULL, created INTEGER NOT NULL
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS trade_history(
+        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, market TEXT NOT NULL, timeframe TEXT NOT NULL,
+        direction TEXT NOT NULL, entry REAL, stop_loss REAL, take_profit REAL, outcome TEXT NOT NULL, reason TEXT DEFAULT '',
+        opened_at INTEGER NOT NULL, closed_at INTEGER NOT NULL
+    )''')
     # Small migrations for databases created by previous PMA versions.
     notif_existing = {r['name'] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
     for name, ddl in {
@@ -695,16 +700,56 @@ def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJP
     batch={}
     try: batch=_tv_scan_many(requested,market,tfs)
     except Exception as ex: errors.append({'scope':'batch','error':str(ex)})
-    for sym in requested:
-        try:
-            setup=prepare_market_setup(sym,market,timeframe,batch.get(sym))
-            context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
-            setup['day_trade_state']='READY' if context_ok and setup['status']=='SIGNAL READY' else ('FORECAST' if setup['direction']!='NO TRADE' else setup['status'])
-            setup['day_trade_reason']=f"{timeframe} forecast is aligned with 1H and 4H context." if context_ok else 'Trend is context only. Wait for the planned pullback and rejection before entering.'
-            results.append(setup)
-        except Exception as ex: errors.append({'symbol':sym,'error':str(ex)})
+    def build(sym):
+        setup=prepare_market_setup(sym,market,timeframe,batch.get(sym))
+        context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
+        setup['day_trade_state']='READY' if context_ok and setup['status']=='SIGNAL READY' else ('FORECAST' if setup['direction']!='NO TRADE' else setup['status'])
+        setup['day_trade_reason']=f"{timeframe} forecast is aligned with 1H and 4H context." if context_ok else 'Trend is context only. Wait for the planned pullback, sniper candle confirmation and risk trigger before entering.'
+        setup['live_trade_state']='READY TO BUY' if setup['status']=='SIGNAL READY' and setup['direction']=='BUY' else ('READY TO SELL' if setup['status']=='SIGNAL READY' and setup['direction']=='SELL' else ('WAITING FOR CONFIRMATION' if setup['direction']!='NO TRADE' else setup['status']))
+        return setup
+    with ThreadPoolExecutor(max_workers=min(8,max(1,len(requested)))) as pool:
+        jobs={pool.submit(build,sym):sym for sym in requested}
+        for job in as_completed(jobs):
+            sym=jobs[job]
+            try: results.append(job.result())
+            except Exception as ex: errors.append({'symbol':sym,'error':str(ex)})
     results.sort(key=lambda x:(0 if x['day_trade_state']=='READY' else 1,x.get('distance_to_entry_zone') if x.get('distance_to_entry_zone') is not None else 10**18))
     return {'date':datetime.now(timezone.utc).strftime('%Y-%m-%d'),'market':market,'setups':results,'errors':errors,'updated_at':utc_iso(),'batch_fast_path':bool(batch),'note':'Trend is context only. Entries require a pullback into demand/supply and rejection confirmation.'}
+
+
+@app.get('/api/trade-monitor/history')
+def trade_monitor_history(req: Request, days: int = 7):
+    u=current(req); days=max(1,min(30,int(days or 7))); cutoff=int(time.time())-days*86400
+    c=db(); rows=c.execute('SELECT * FROM trade_history WHERE user_id=? AND closed_at>=? ORDER BY closed_at DESC',(u['id'],cutoff)).fetchall(); c.close()
+    counts={'take_profit':0,'stop_loss':0,'manual_close':0,'close_in_profit':0,'close_in_loss':0}
+    items=[]
+    for r in rows:
+        outcome=r['outcome']; counts[outcome]=counts.get(outcome,0)+1
+        items.append({k:r[k] for k in ('id','symbol','market','timeframe','direction','entry','stop_loss','take_profit','outcome','reason','opened_at','closed_at')})
+    return {'days':days,'counts':counts,'total':len(items),'trades':items}
+
+
+class TradeHistoryEvent(BaseModel):
+    symbol: str
+    market: str = 'Forex'
+    timeframe: str = '15m'
+    direction: str
+    entry: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    outcome: str
+    reason: str = ''
+    opened_at: int | None = None
+
+
+@app.post('/api/trade-monitor/history')
+def trade_monitor_history_add(req: Request, x: TradeHistoryEvent):
+    u=current(req); allowed={'take_profit','stop_loss','manual_close','close_in_profit','close_in_loss'}
+    if x.outcome not in allowed: raise HTTPException(400,'Unsupported trade outcome')
+    now=int(time.time()); opened=int(x.opened_at or now)
+    c=db(); c.execute('INSERT INTO trade_history(user_id,symbol,market,timeframe,direction,entry,stop_loss,take_profit,outcome,reason,opened_at,closed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+        (u['id'],x.symbol.upper(),x.market,x.timeframe,x.direction,x.entry,x.stop_loss,x.take_profit,x.outcome,x.reason,opened,now)); c.commit(); c.close()
+    return {'ok':True}
 
 
 @app.get('/api/referrals')
