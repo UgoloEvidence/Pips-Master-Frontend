@@ -484,7 +484,7 @@ def signup(x: Signup):
 @app.get('/api/auth/email-status')
 def auth_email_status(req: Request):
     # Safe diagnostic endpoint: exposes configuration state, never credentials.
-    return {'configured': _email_provider_configured(), 'provider': _email_provider_name(), 'from_configured': bool(EMAIL_FROM), 'verification_required_on_login': True}
+    return {'configured': _email_provider_configured(), 'provider': _email_provider_name(), 'from_configured': bool(EMAIL_FROM), 'verification_required_on_login': False}
 
 
 @app.post('/api/auth/login')
@@ -501,19 +501,16 @@ def login(x: Login):
             'admin', ADMIN_USERNAME, ADMIN_FULL_NAME, row['id']))
         c.commit(); row=c.execute('SELECT * FROM users WHERE id=?',(row['id'],)).fetchone()
 
-    # Every explicit login requires a fresh six-digit email verification code.
-    # Do not silently retry this operation: retrying would generate multiple codes
-    # and invalidate the previous one.
-    if not _email_provider_configured():
-        c.close()
-        raise HTTPException(503,'Email verification is not configured on the PMA server. Add RESEND_API_KEY (recommended) or SMTP_HOST, SMTP_USER and SMTP_PASSWORD in Render Environment Variables.')
-    try:
-        _issue_verification(c,row)
-        c.commit(); c.close()
-    except Exception as ex:
-        c.rollback(); c.close()
-        raise HTTPException(503,f'PMA could not send the verification email. Check the email provider settings in Render. ({str(ex)})')
-    raise HTTPException(403,'EMAIL_VERIFY_REQUIRED')
+    # Login is password-based. Do not block an existing account on email delivery.
+    # Email verification remains available for newly created accounts, but the
+    # explicit login flow no longer requires a six-digit code.
+    now=int(time.time())
+    c.execute("UPDATE users SET email_verified=1,last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?",(now,row['id']))
+    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
+    c.commit()
+    fresh=c.execute('SELECT * FROM users WHERE id=?',(row['id'],)).fetchone()
+    c.close()
+    return {'ok':True,'logged_in':True,'message':'Signed in successfully.','user':user_out(fresh),'token':make_token(fresh['id'])}
 
 
 @app.post('/api/auth/logout')

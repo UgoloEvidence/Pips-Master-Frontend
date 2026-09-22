@@ -32,3 +32,6 @@ Do NOT put the email API key, SMTP password, or admin password in frontend files
 The login page now reports the actual provider/configuration problem instead of hiding it behind "Please try again in a moment."
 
 The frontend no longer retries /auth/login because retrying login would generate multiple verification codes and invalidate the previous one.
+
+
+LOGIN CHANGE: Existing users can now sign in with email + password without a six-digit email code. Email provider configuration is still used for new-account email verification and related verification flows.
