@@ -150,6 +150,173 @@ def fetch(symbol: str, interval: str):
     return rows
 
 
+
+TV_TF = {'1m':'1','5m':'5','15m':'15','30m':'30','1h':'60','4h':'240','1d':'1D'}
+TV_TICKER_PREFIXES = {
+    'Forex': ['OANDA:', 'FX_IDC:'],
+    'Metals': ['OANDA:', 'TVC:'],
+    'Crypto': ['COINBASE:', 'BINANCE:'],
+    'Indices': ['CAPITALCOM:', 'TVC:'],
+    'Commodities': ['TVC:', 'OANDA:'],
+}
+
+
+def _tv_field(base, tf):
+    suffix = TV_TF[tf]
+    return base if tf == '1d' else f'{base}|{suffix}'
+
+
+def _tv_tickers(symbol, market='Forex'):
+    s = norm_symbol(symbol)
+    if market == 'Crypto' and s.endswith('USD'):
+        return [p + s for p in TV_TICKER_PREFIXES['Crypto']]
+    return [p + s for p in TV_TICKER_PREFIXES.get(market, ['OANDA:', 'FX_IDC:'])]
+
+
+def _tv_scan(symbol, market='Forex', timeframes=None):
+    """Fetch verified current OHLC/indicator snapshots directly from TradingView's public scanner.
+    One request carries all requested timeframes, avoiding the six-provider-call bottleneck that
+    previously left the UI spinning when Yahoo Finance throttled or blocked the Render process.
+    """
+    timeframes = list(timeframes or ['15m','30m','1h','4h','1d'])
+    columns = []
+    bases = ['open','high','low','close','RSI','EMA20','EMA50','EMA100','ATR','Recommend.All',
+             'Pivot.M.Classic.S1','Pivot.M.Classic.R1','change']
+    for tf in timeframes:
+        for base in bases:
+            columns.append(_tv_field(base, tf))
+    last_error = None
+    for ticker in _tv_tickers(symbol, market):
+        payload = {
+            'symbols': {'tickers': [ticker], 'query': {'types': []}},
+            'columns': columns,
+            'range': [0, 1],
+            'options': {'lang': 'en'},
+        }
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            'https://scanner.tradingview.com/forex/scan' if market in ('Forex','Metals') else
+            ('https://scanner.tradingview.com/crypto/scan' if market == 'Crypto' else
+             'https://scanner.tradingview.com/global/scan'),
+            data=data,
+            headers={
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 PMA/3.0',
+                'Origin': 'https://www.tradingview.com',
+                'Referer': 'https://www.tradingview.com/',
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as response:
+                raw = json.loads(response.read().decode('utf-8', errors='replace'))
+            rows = raw.get('data') or []
+            if not rows:
+                last_error = ValueError(f'TradingView returned no row for {ticker}')
+                continue
+            values = rows[0].get('d') or []
+            if len(values) != len(columns):
+                last_error = ValueError(f'TradingView returned an unexpected column count for {ticker}')
+                continue
+            flat = dict(zip(columns, values))
+            out = {}
+            for tf in timeframes:
+                def num(base):
+                    v = flat.get(_tv_field(base, tf))
+                    try: return float(v) if v is not None else None
+                    except (TypeError, ValueError): return None
+                out[tf] = {
+                    'ticker': rows[0].get('s', ticker),
+                    'open': num('open'), 'high': num('high'), 'low': num('low'), 'close': num('close'),
+                    'rsi': num('RSI'), 'ema20': num('EMA20'), 'ema50': num('EMA50'), 'ema100': num('EMA100'),
+                    'atr': num('ATR'), 'recommend': num('Recommend.All'),
+                    's1': num('Pivot.M.Classic.S1'), 'r1': num('Pivot.M.Classic.R1'), 'change': num('change'),
+                }
+            if any(out[tf].get('close') is not None for tf in timeframes):
+                return out
+        except Exception as exc:
+            last_error = exc
+    raise ValueError(f'No verified TradingView market response for {symbol}: {last_error}')
+
+
+def _snapshot_trend(s):
+    close, e20, e50, e100 = s.get('close'), s.get('ema20'), s.get('ema50'), s.get('ema100')
+    if None in (close, e20, e50): return 'Neutral'
+    if close > e20 > e50 and (e100 is None or e50 > e100): return 'Bullish'
+    if close < e20 < e50 and (e100 is None or e50 < e100): return 'Bearish'
+    if close > e20 > e50: return 'Bullish'
+    if close < e20 < e50: return 'Bearish'
+    return 'Neutral'
+
+
+def _tv_setup(symbol, market, trigger_tf, snaps):
+    trigger = snaps[trigger_tf]
+    trend = _snapshot_trend(trigger)
+    context = {tf: _snapshot_trend(snaps[tf]) for tf in ('15m','30m','1h','4h','1d') if tf in snaps}
+    bull = sum(v == 'Bullish' for v in context.values())
+    bear = sum(v == 'Bearish' for v in context.values())
+    rec = trigger.get('recommend') if trigger.get('recommend') is not None else 0
+    rsi_v = trigger.get('rsi') if trigger.get('rsi') is not None else 50
+    close = trigger.get('close')
+    atr_v = max(trigger.get('atr') or 0, 1e-12)
+    s1, r1 = trigger.get('s1'), trigger.get('r1')
+    if close is None: raise ValueError(f'No verified close for {symbol} {trigger_tf}')
+
+    direction = 'NO TRADE'; status = 'WAITING FOR CONFIRMATION'; reasons = []
+    if trend == 'Bullish' and rsi_v >= 50 and rec >= 0 and bull >= 2:
+        direction = 'BUY'
+        trigger_price = r1 if r1 is not None else close + atr_v * 0.25
+        confirmed = close >= trigger_price and rec >= 0.25
+        status = 'SIGNAL READY' if confirmed else 'APPROACHING'
+        reasons = ['Trigger timeframe trend is bullish', 'RSI is above the neutral line', f'{bull}/5 context timeframes are bullish', f'TradingView technical rating: {rec:.2f}']
+        reasons.append('Price has crossed the trigger zone' if confirmed else 'Waiting for price to confirm the trigger zone')
+        entry = trigger_price
+        stop = min(s1 if s1 is not None else close - atr_v * 0.8, entry - atr_v * 0.35)
+        risk = max(entry - stop, atr_v * 0.25)
+        tp1, tp2 = entry + risk, entry + risk * 2
+        next_zone = r1 if r1 is not None else entry + atr_v
+        zone_type = 'Resistance / breakout zone'
+    elif trend == 'Bearish' and rsi_v <= 50 and rec <= 0 and bear >= 2:
+        direction = 'SELL'
+        trigger_price = s1 if s1 is not None else close - atr_v * 0.25
+        confirmed = close <= trigger_price and rec <= -0.25
+        status = 'SIGNAL READY' if confirmed else 'APPROACHING'
+        reasons = ['Trigger timeframe trend is bearish', 'RSI is below the neutral line', f'{bear}/5 context timeframes are bearish', f'TradingView technical rating: {rec:.2f}']
+        reasons.append('Price has crossed the trigger zone' if confirmed else 'Waiting for price to confirm the trigger zone')
+        entry = trigger_price
+        stop = max(r1 if r1 is not None else close + atr_v * 0.8, entry + atr_v * 0.35)
+        risk = max(stop - entry, atr_v * 0.25)
+        tp1, tp2 = entry - risk, entry - risk * 2
+        next_zone = s1 if s1 is not None else entry - atr_v
+        zone_type = 'Support / breakdown zone'
+    else:
+        entry = stop = tp1 = tp2 = next_zone = trigger_price = None
+        zone_type = None
+        reasons = ['Confluence is insufficient for a directional setup', f'TradingView technical rating: {rec:.2f}']
+
+    if direction == 'NO TRADE':
+        return {
+            'direction':'NO TRADE','score':0,'status':status,'reasons':reasons,'structure':'Mixed / no confirmed structure',
+            'trigger_text':f'Wait for {trigger_tf} confirmation','trigger_price':None,'entry_zone':None,'stop_loss':None,
+            'take_profit_1':None,'take_profit_2':None,'next_zone':None,'next_zone_type':None,
+            'candles_to_next_zone':None,'estimated_minutes_to_next_zone':None,'distance_to_next_zone':None,
+            'atr':atr_v,'last':close,'support':s1,'resistance':r1,'rsi':rsi_v,'trend':trend,'trend_scores':list(context.values()),
+            'context_trends':context,'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'TradingView live technical snapshot; historical backtest unavailable'},
+        }
+    distance=abs((next_zone or close)-close)
+    tf_minutes=TIMEFRAME_MINUTES.get(trigger_tf,15)
+    candles=max(1,min(96,math.ceil(distance/max(atr_v,1e-12))))
+    rec_confirm = rec >= 0.25 if direction == 'BUY' else rec <= -0.25
+    score=min(100,25 + (20 if (rsi_v>=50 if direction=='BUY' else rsi_v<=50) else 0) + min(25,(bull if direction=='BUY' else bear)*5) + (15 if rec_confirm else 0) + (15 if status=='SIGNAL READY' else 0))
+    return {
+        'direction':direction,'score':score,'status':status,'reasons':reasons,'structure':'Bullish momentum structure' if direction=='BUY' else 'Bearish momentum structure',
+        'trigger_text':f'{trigger_tf} price confirmation at {trigger_price:.8f}','trigger_price':trigger_price,'entry_zone':entry,
+        'stop_loss':stop,'take_profit_1':tp1,'take_profit_2':tp2,'next_zone':next_zone,'next_zone_type':zone_type,
+        'candles_to_next_zone':candles,'estimated_minutes_to_next_zone':candles*tf_minutes,'distance_to_next_zone':distance,
+        'atr':atr_v,'last':close,'support':s1,'resistance':r1,'rsi':rsi_v,'trend':trend,'trend_scores':list(context.values()),'context_trends':context,
+        'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'Live TradingView technical snapshot; no historical result is presented as a backtest'},
+    }
+
 def ema(values, n):
     if not values:
         return 0.0

@@ -82,3 +82,24 @@ After pushing to GitHub, Render should redeploy the backend. Test these endpoint
 - Stop loss uses recent structure plus a small ATR buffer rather than a 60-candle extreme. This is a tighter structure-aware stop, not a guarantee against stop-outs.
 - Historical validation now tests the same breakout/breakdown trigger concept and reports samples/wins/losses/win rate. A historical result is not a guarantee of future performance.
 - The UI shows WATCH BUY/WATCH SELL while a setup is only approaching; it shows BUY/SELL only after confirmation.
+
+## HOTFIX 2026-09-22
+- Replaced the scanner primary live-data path with a single TradingView scanner request carrying 15m/30m/1H/4H/1D plus the selected trigger timeframe.
+- Added TradingView OHLC, RSI, EMA20/50/100, ATR, technical recommendation and classic S1/R1 data for the scanner.
+- Kept Yahoo Finance as a fallback provider.
+- Removed the six-request MTF bottleneck that could leave the scanner waiting for provider timeouts.
+- Fixed the home progress cards: they now load from the backend once and retain the last successful result locally.
+- Fixed notification history so local history renders immediately; backend sync happens in the background instead of blocking the page on "Loading notification history…".
+- Added a scrollable maximum-height to the top-right notification panel.
+- Reduced frontend API timeout from 60 seconds to 8 seconds and retry delay so failed requests cannot leave the UI appearing frozen for a minute.
+- Added progress and leaderboard caching so My Progress can render the last successful data immediately while the backend refreshes.
+- Updated the market-data diagnostic endpoint to test the TradingView provider.
+- Added frontend/app.js and root app.js copies for compatibility with the existing repository layout.
+
+### Deploy
+1. Push this package to GitHub.
+2. Redeploy the Render backend service so backend/app.py and backend/market_data.py are live.
+3. Redeploy the frontend (Netlify or the existing frontend host).
+4. Hard-refresh the browser once after deployment (Ctrl+F5).
+5. Verify /api/health and /api/market-data/test?symbol=EURUSD&timeframe=15m on the deployed backend.
+

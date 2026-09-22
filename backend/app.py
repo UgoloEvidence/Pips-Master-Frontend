@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import bcrypt
 from pydantic import BaseModel, EmailStr
 
-from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso, norm_symbol
+from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso, norm_symbol, _tv_scan, _tv_setup
 
 ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').lower()
 ADMIN_USERNAME = os.getenv('PMA_ADMIN_USERNAME', 'PipsMaster')
@@ -501,42 +501,74 @@ def my_feedback(req: Request):
 
 def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
     trigger_timeframe = trigger_timeframe if trigger_timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m'
-    # Load the context candles concurrently. This keeps the API responsive without
-    # changing which multi-timeframe frames are used by the scanner.
-    frame_names = ('15m','30m','1h','4h','1d')
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        jobs = {pool.submit(fetch, symbol, tf): tf for tf in frame_names}
-        frames = {}
-        for job in as_completed(jobs):
-            frames[jobs[job]] = job.result()
-    trigger_rows = fetch(symbol, trigger_timeframe)
-    setup = analyze_setup(trigger_rows, frames, trigger_timeframe)
-    trends = {tf: trend_info(frames[tf]) for tf in frames}
-    validation = backtest(trigger_rows)
-    psize = pip_size(symbol)
-    reasons = setup.get('reasons', [])
-    if setup['direction'] != 'NO TRADE':
-        reasons = reasons or ['Automated confluence conditions are being monitored.']
-    return {
-        'symbol':symbol.upper(),'market':market,'direction':setup['direction'],'setup_strength':setup['score'],'status':setup['status'],
-        'entry_zone':round(setup['entry_zone'],8) if setup['entry_zone'] is not None else None,
-        'entry_note':'Use the zone as a planning area, not an exact guaranteed fill.',
-        'stop_loss':round(setup['stop_loss'],8) if setup['stop_loss'] is not None else None,
-        'take_profit_1':round(setup['take_profit_1'],8) if setup['take_profit_1'] is not None else None,
-        'take_profit_2':round(setup['take_profit_2'],8) if setup['take_profit_2'] is not None else None,
-        'risk_reward':'1:1 / 1:2 target framework' if setup['direction'] != 'NO TRADE' else '—',
-        'zone_type':setup.get('next_zone_type'),'next_zone':round(setup['next_zone'],8) if setup['next_zone'] is not None else None,
-        'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,
-        'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
-        'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),
-        'timeframe':trigger_timeframe,'atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),'support':round(setup['support'],8),'resistance':round(setup['resistance'],8),
-        'rsi_trigger':setup['rsi'],'structure':setup['structure'],'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,
-        'next_signal_status':'TRIGGERED' if setup['status']=='SIGNAL READY' else 'WAITING FOR CONFIRMATION',
-        'trade_state':'ACTIVE' if setup['status']=='SIGNAL READY' else setup['status'],
-        'next_signal_trigger':setup['trigger_text'],'reasons':reasons,
-        'trends':{tf:trends[tf]['trend'] for tf in trends},'trend_detail':trends,'trend_alignment':f"{sum(1 for v in trends.values() if v['trend']==setup['trend'])}/5",
-        'validation':validation,'data_source':'Verified market chart feed','updated_at':utc_iso(),'method':'PMA confluence engine: trend + RSI + structure + multi-timeframe alignment + ATR zone projection'
-    }
+    # Primary live source: one TradingView scanner request carries all MTF snapshots.
+    # This removes the old six-request Yahoo bottleneck that caused long loading states.
+    try:
+        tfs = ['15m','30m','1h','4h','1d']
+        if trigger_timeframe not in tfs:
+            tfs.append(trigger_timeframe)
+        snaps = _tv_scan(symbol, market, tfs)
+        setup = _tv_setup(symbol, market, trigger_timeframe, snaps)
+        psize = pip_size(symbol)
+        trends = {tf:_snapshot_trend_safe(snaps[tf]) for tf in snaps}
+        return {
+            'symbol':symbol.upper(),'market':market,'direction':setup['direction'],'setup_strength':setup['score'],'status':setup['status'],
+            'entry_zone':round(setup['entry_zone'],8) if setup['entry_zone'] is not None else None,
+            'entry_note':'Use the zone as a planning area, not an exact guaranteed fill.',
+            'stop_loss':round(setup['stop_loss'],8) if setup['stop_loss'] is not None else None,
+            'take_profit_1':round(setup['take_profit_1'],8) if setup['take_profit_1'] is not None else None,
+            'take_profit_2':round(setup['take_profit_2'],8) if setup['take_profit_2'] is not None else None,
+            'risk_reward':'1:1 / 1:2 target framework' if setup['direction'] != 'NO TRADE' else '—',
+            'zone_type':setup.get('next_zone_type'),'next_zone':round(setup['next_zone'],8) if setup['next_zone'] is not None else None,
+            'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,
+            'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
+            'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),
+            'timeframe':trigger_timeframe,'atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),'support':round(setup['support'],8) if setup['support'] is not None else None,'resistance':round(setup['resistance'],8) if setup['resistance'] is not None else None,
+            'rsi_trigger':setup['rsi'],'structure':setup['structure'],'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,
+            'next_signal_status':'TRIGGERED' if setup['status']=='SIGNAL READY' else 'WAITING FOR CONFIRMATION',
+            'trade_state':'ACTIVE' if setup['status']=='SIGNAL READY' else setup['status'],'next_signal_trigger':setup['trigger_text'],'reasons':setup['reasons'],
+            'trends':{tf:trends[tf] for tf in ('15m','30m','1h','4h','1d') if tf in trends},
+            'trend_detail':{tf:{'trend':trends[tf], 'rsi':snaps[tf].get('rsi'), 'close':snaps[tf].get('close'), 'ema20':snaps[tf].get('ema20'), 'ema50':snaps[tf].get('ema50')} for tf in snaps},
+            'trend_alignment':f"{sum(1 for v in setup['context_trends'].values() if v==setup['trend'])}/5" if setup['trend'] != 'Neutral' else '0/5',
+            'validation':setup['validation'],'data_source':'Verified TradingView scanner feed','updated_at':utc_iso(),
+            'method':'PMA confluence engine: TradingView MTF trend + RSI + technical rating + pivot trigger + ATR risk structure'
+        }
+    except Exception as tv_error:
+        # Fallback to the previous Yahoo candle engine. If both fail, the caller exposes
+        # the real provider error instead of fabricating a signal.
+        frame_names=('15m','30m','1h','4h','1d')
+        try:
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                jobs={pool.submit(fetch,symbol,tf):tf for tf in frame_names}
+                frames={jobs[job]:job.result() for job in as_completed(jobs)}
+            trigger_rows=fetch(symbol,trigger_timeframe)
+            setup=analyze_setup(trigger_rows,frames,trigger_timeframe)
+            trends={tf:trend_info(frames[tf]) for tf in frames}
+            validation=backtest(trigger_rows)
+            psize=pip_size(symbol)
+            return {
+                'symbol':symbol.upper(),'market':market,'direction':setup['direction'],'setup_strength':setup['score'],'status':setup['status'],
+                'entry_zone':round(setup['entry_zone'],8) if setup['entry_zone'] is not None else None,'entry_note':'Use the zone as a planning area, not an exact guaranteed fill.',
+                'stop_loss':round(setup['stop_loss'],8) if setup['stop_loss'] is not None else None,'take_profit_1':round(setup['take_profit_1'],8) if setup['take_profit_1'] is not None else None,'take_profit_2':round(setup['take_profit_2'],8) if setup['take_profit_2'] is not None else None,
+                'risk_reward':'1:1 / 1:2 target framework' if setup['direction']!='NO TRADE' else '—','zone_type':setup.get('next_zone_type'),'next_zone':round(setup['next_zone'],8) if setup['next_zone'] is not None else None,
+                'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
+                'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),'timeframe':trigger_timeframe,
+                'atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),'support':round(setup['support'],8),'resistance':round(setup['resistance'],8),'rsi_trigger':setup['rsi'],'structure':setup['structure'],
+                'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,'next_signal_status':'TRIGGERED' if setup['status']=='SIGNAL READY' else 'WAITING FOR CONFIRMATION','trade_state':'ACTIVE' if setup['status']=='SIGNAL READY' else setup['status'],
+                'next_signal_trigger':setup['trigger_text'],'reasons':setup['reasons'],'trends':{tf:trends[tf]['trend'] for tf in trends},'trend_detail':trends,
+                'trend_alignment':f"{sum(1 for v in trends.values() if v['trend']==setup['trend'])}/5",'validation':validation,'data_source':'Verified Yahoo Finance chart feed',
+                'updated_at':utc_iso(),'method':'PMA confluence engine: trend + RSI + structure + multi-timeframe alignment + ATR zone projection'
+            }
+        except Exception as yahoo_error:
+            raise ValueError(f'TradingView feed failed ({tv_error}); Yahoo fallback failed ({yahoo_error})')
+
+
+def _snapshot_trend_safe(snapshot):
+    close, e20, e50, e100 = snapshot.get('close'), snapshot.get('ema20'), snapshot.get('ema50'), snapshot.get('ema100')
+    if None in (close, e20, e50): return 'Neutral'
+    if close > e20 > e50 and (e100 is None or e50 > e100): return 'Bullish'
+    if close < e20 < e50 and (e100 is None or e50 < e100): return 'Bearish'
+    return 'Neutral'
 
 
 @app.get('/api/health')
@@ -549,8 +581,9 @@ def market_data_test(symbol: str='EURUSD', timeframe: str='15m'):
     if timeframe not in {'1m','5m','15m','1h','4h','1d'}:
         raise HTTPException(400,'Unsupported timeframe. Use 1m, 5m, 15m, 1h, 4h or 1d.')
     try:
-        rows=fetch(symbol,timeframe)
-        return {'ok':True,'symbol':norm_symbol(symbol),'timeframe':timeframe,'candles':len(rows),'last_close':rows[-1]['close'],'updated_at':utc_iso()}
+        snaps=_tv_scan(symbol,'Forex',[timeframe])
+        s=snaps[timeframe]
+        return {'ok':True,'provider':'TradingView scanner','symbol':norm_symbol(symbol),'timeframe':timeframe,'last_close':s.get('close'),'rsi':s.get('rsi'),'recommendation':s.get('recommend'),'updated_at':utc_iso()}
     except Exception as ex:
         raise HTTPException(503,f'Market data test failed: {ex}')
 
