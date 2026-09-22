@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import bcrypt
 from pydantic import BaseModel, EmailStr
 
-from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso, norm_symbol, _tv_scan, _tv_setup
+from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso, norm_symbol, _tv_scan, _tv_setup, DEFAULT_FOREX_WATCHLIST, optimize_strict_scanner
 
 ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').lower()
 ADMIN_USERNAME = os.getenv('PMA_ADMIN_USERNAME', 'PipsMaster')
@@ -521,6 +521,8 @@ def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
             'risk_reward':'1:1 / 1:2 target framework' if setup['direction'] != 'NO TRADE' else '—',
             'zone_type':setup.get('next_zone_type'),'next_zone':round(setup['next_zone'],8) if setup['next_zone'] is not None else None,
             'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,
+            'distance_to_entry_zone':round(abs(setup['entry_zone']-setup['last']),8) if setup['entry_zone'] is not None else None,
+            'pips_to_entry_zone':round(abs(setup['entry_zone']-setup['last'])/psize,1) if setup['entry_zone'] is not None else None,
             'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
             'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),
             'timeframe':trigger_timeframe,'atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),'support':round(setup['support'],8) if setup['support'] is not None else None,'resistance':round(setup['resistance'],8) if setup['resistance'] is not None else None,
@@ -538,10 +540,13 @@ def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
         # the real provider error instead of fabricating a signal.
         frame_names=('15m','30m','1h','4h','1d')
         try:
-            with ThreadPoolExecutor(max_workers=5) as pool:
-                jobs={pool.submit(fetch,symbol,tf):tf for tf in frame_names}
-                frames={jobs[job]:job.result() for job in as_completed(jobs)}
-            trigger_rows=fetch(symbol,trigger_timeframe)
+            # Bound the fallback too: trigger + all context frames are fetched concurrently.
+            all_frames=tuple(dict.fromkeys(frame_names+(trigger_timeframe,)))
+            with ThreadPoolExecutor(max_workers=len(all_frames)) as pool:
+                jobs={pool.submit(fetch,symbol,tf):tf for tf in all_frames}
+                fetched={jobs[job]:job.result() for job in as_completed(jobs)}
+            frames={tf:fetched[tf] for tf in frame_names}
+            trigger_rows=fetched[trigger_timeframe]
             setup=analyze_setup(trigger_rows,frames,trigger_timeframe)
             trends={tf:trend_info(frames[tf]) for tf in frames}
             validation=backtest(trigger_rows)
@@ -551,7 +556,7 @@ def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
                 'entry_zone':round(setup['entry_zone'],8) if setup['entry_zone'] is not None else None,'entry_note':'Use the zone as a planning area, not an exact guaranteed fill.',
                 'stop_loss':round(setup['stop_loss'],8) if setup['stop_loss'] is not None else None,'take_profit_1':round(setup['take_profit_1'],8) if setup['take_profit_1'] is not None else None,'take_profit_2':round(setup['take_profit_2'],8) if setup['take_profit_2'] is not None else None,
                 'risk_reward':'1:1 / 1:2 target framework' if setup['direction']!='NO TRADE' else '—','zone_type':setup.get('next_zone_type'),'next_zone':round(setup['next_zone'],8) if setup['next_zone'] is not None else None,
-                'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
+                'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,'distance_to_entry_zone':round(abs(setup['entry_zone']-setup['last']),8) if setup['entry_zone'] is not None else None,'pips_to_entry_zone':round(abs(setup['entry_zone']-setup['last'])/psize,1) if setup['entry_zone'] is not None else None,'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
                 'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),'timeframe':trigger_timeframe,
                 'atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),'support':round(setup['support'],8),'resistance':round(setup['resistance'],8),'rsi_trigger':setup['rsi'],'structure':setup['structure'],
                 'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,'next_signal_status':'TRIGGERED' if setup['status']=='SIGNAL READY' else 'WAITING FOR CONFIRMATION','trade_state':'ACTIVE' if setup['status']=='SIGNAL READY' else setup['status'],
@@ -573,7 +578,7 @@ def _snapshot_trend_safe(snapshot):
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'service':'Pips Master Academy API','market_data':'Yahoo Finance chart feed','timeframes':['1m','5m','15m','1h','4h','1d'],'updated_at':utc_iso()}
+    return {'ok':True,'service':'Pips Master Academy API','market_data':'TradingView scanner feed with Yahoo fallback','timeframes':['1m','5m','15m','1h','4h','1d'],'updated_at':utc_iso()}
 
 
 @app.get('/api/market-data/test')
@@ -589,23 +594,54 @@ def market_data_test(symbol: str='EURUSD', timeframe: str='15m'):
 
 
 @app.get('/api/signals/scan')
-def scan(market: str='Forex', symbols: str='EURUSD', timeframe: str='15m'):
-    requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:20]
+def scan(market: str='Forex', symbols: str='', timeframe: str='15m'):
+    if symbols.strip():
+        requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:20]
+    elif market == 'Forex':
+        requested=DEFAULT_FOREX_WATCHLIST[:]  # Always scan at least six major/active FX pairs by default.
+    else:
+        requested=[x.strip().upper() for x in symbols.split(',') if x.strip()] if symbols.strip() else []
     opportunities=[]; errors=[]
-    for sym in requested:
-        try:
-            opportunities.append(prepare_market_setup(sym,market,timeframe))
-        except Exception as ex:
-            errors.append({'symbol':sym,'error':str(ex)})
-    # Prioritise actual ready setups, then the closest next-zone estimate.
-    opportunities.sort(key=lambda x:(0 if x['direction']!='NO TRADE' else 1, x['estimated_minutes_to_next_zone'] if x['estimated_minutes_to_next_zone'] is not None else 10**9, -(x['setup_strength'] or 0)))
+    def build(sym):
+        return prepare_market_setup(sym,market,timeframe)
+    with ThreadPoolExecutor(max_workers=min(6,max(1,len(requested)))) as pool:
+        jobs={pool.submit(build,sym):sym for sym in requested}
+        for job in as_completed(jobs):
+            sym=jobs[job]
+            try: opportunities.append(job.result())
+            except Exception as ex: errors.append({'symbol':sym,'error':str(ex)})
+
+    # Closest = nearest planned entry zone by price distance, with real READY setups
+    # taking precedence only when their entry is actually confirmed.
+    def rank_key(x):
+        ready=0 if x.get('status') in ('SIGNAL READY','ACTIVE') else 1
+        dist=x.get('distance_to_entry_zone')
+        if dist is None: dist=x.get('distance_to_next_zone')
+        return (ready, dist if dist is not None else 10**18, -(x.get('setup_strength') or 0))
+    opportunities.sort(key=rank_key)
+    closest=opportunities[0] if opportunities else None
     return {
-        'closest':opportunities[0] if opportunities else None,
+        'closest':closest,
+        'closest_pair':closest.get('symbol') if closest else None,
         'timeframe': timeframe if timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m',
         'opportunities':opportunities,'errors':errors,'market':market,'symbols':requested,
-        'message':'Verified candle data loaded.' if opportunities else 'No verified candle data was returned; no signal is being invented.',
+        'pairs_scanned':len(requested),'minimum_pairs':6 if market=='Forex' else min(6,len(requested)),
+        'message':f'Verified candle data loaded for {len(opportunities)} pair(s).' if opportunities else 'No verified candle data was returned; no signal is being invented.',
         'updated_at':utc_iso()
     }
+
+
+@app.get('/api/scanner/backtest')
+def scanner_backtest(market: str='Forex', symbols: str='', timeframes: str='15m,1h,4h'):
+    if market != 'Forex':
+        raise HTTPException(400, 'The optimization engine currently targets Forex currency pairs.')
+    requested=[x.strip().upper() for x in symbols.split(',') if x.strip()] if symbols.strip() else DEFAULT_FOREX_WATCHLIST[:]
+    tfs=[x.strip() for x in timeframes.split(',') if x.strip() and x.strip() in {'15m','1h','4h'}]
+    if not tfs: tfs=['15m','1h','4h']
+    try:
+        return optimize_strict_scanner(requested[:6], tfs)
+    except Exception as ex:
+        raise HTTPException(503, f'Backtest engine could not complete: {ex}')
 
 
 @app.get('/api/signals/candles')
@@ -620,16 +656,20 @@ def candles(symbol: str='EURUSD', timeframe: str='15m'):
 def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJPY,XAUUSD,BTCUSD', timeframe: str='15m'):
     requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:15]
     results=[]; errors=[]
-    for sym in requested:
-        try:
-            setup=prepare_market_setup(sym,market,timeframe)
-            # Day-trade focus: user-selected trigger timeframe with 1h/4h context.
-            context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
-            setup['day_trade_state']='READY' if context_ok and setup['setup_strength']>=60 else 'WAITING'
-            setup['day_trade_reason']=f"{timeframe} trigger is aligned with 1h and 4h context." if context_ok else 'Wait for cleaner 1h/4h confirmation.'
-            results.append(setup)
-        except Exception as ex:
-            errors.append({'symbol':sym,'error':str(ex)})
+    # Fetch the small day-trade watchlist concurrently. The old sequential loop could
+    # wait several seconds per symbol when a provider was slow.
+    def build(sym):
+        setup=prepare_market_setup(sym,market,timeframe)
+        context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
+        setup['day_trade_state']='READY' if context_ok and setup['status']=='SIGNAL READY' else ('FORECAST' if setup['direction']!='NO TRADE' else 'WAITING')
+        setup['day_trade_reason']=f"{timeframe} forecast is aligned with 1H and 4H context." if context_ok else 'Forecast is developing; wait for cleaner 1H/4H confirmation.'
+        return setup
+    with ThreadPoolExecutor(max_workers=min(4,max(1,len(requested)))) as pool:
+        jobs={pool.submit(build,sym):sym for sym in requested}
+        for job in as_completed(jobs):
+            sym=jobs[job]
+            try: results.append(job.result())
+            except Exception as ex: errors.append({'symbol':sym,'error':str(ex)})
     results.sort(key=lambda x:(0 if x['day_trade_state']=='READY' else 1,-(x['setup_strength'] or 0)))
     return {'date':datetime.now(timezone.utc).strftime('%Y-%m-%d'),'market':market,'setups':results,'errors':errors,'updated_at':utc_iso(),'note':'Day-trade projections are estimates based on verified candle data; future price movement is not guaranteed.'}
 

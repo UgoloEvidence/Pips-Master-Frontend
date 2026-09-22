@@ -103,3 +103,40 @@ After pushing to GitHub, Render should redeploy the backend. Test these endpoint
 4. Hard-refresh the browser once after deployment (Ctrl+F5).
 5. Verify /api/health and /api/market-data/test?symbol=EURUSD&timeframe=15m on the deployed backend.
 
+
+
+HOTFIX 2026-09-22 PERFORMANCE + FORECAST UPDATE
+- TradingView MTF requests now use a short fresh-data cache and parallel provider-symbol fallback, avoiding serial timeout waits.
+- Day Trade watchlist fetches its symbols concurrently instead of one-by-one.
+- Yahoo fallback requests are also concurrent and have bounded 5-second provider timeouts.
+- Scanner setup logic is forecast-first: it can identify a planned BUY/SELL before price reaches the zone, and it specifically avoids late BUY calls directly into nearby supply or late SELL calls directly into nearby demand.
+- Forecast setups are labeled FORECAST and tell the user to wait for the planned zone/rejection; only an actual confirmation becomes SIGNAL READY.
+- Frontend no longer displays setup strength as a numeric /100 score. It shows qualitative confluence wording instead.
+- Day Trade keeps a recent verified snapshot in local storage so the page is useful immediately while the fresh backend request runs.
+- The backend score remains available internally for sorting/logic; the frontend presentation does not expose the raw score.
+
+Deploy: replace the project files, then run:
+cd "C:\Users\Confidence Ugolo\Desktop\pma_full_rebuilt"
+git add .
+git commit -m "Speed up market data and add forecast-first trade setups"
+git push origin main
+
+HOTFIX 2026-09-22 — HIGH-PRECISION SCANNER FILTER
+- Tightened automated scanner directional gate to reduce marginal setups.
+- BUY forecasts require bullish trigger structure, at least 3/5 MTF bullish contexts, RSI 52–68, and TradingView technical rating >= +0.25.
+- SELL forecasts require bearish trigger structure, at least 3/5 MTF bearish contexts, RSI 32–48, and TradingView technical rating <= -0.25.
+- Zone rejection forecasts are retained but require stronger exhaustion conditions: RSI >=60 near supply for pullback forecasts, or RSI <=40 near demand for bounce forecasts.
+- Marginal signals are now rejected as NO TRADE instead of being surfaced merely because a directional bias exists.
+- Internal setup score remains available for ranking, while frontend continues to display qualitative strength labels rather than a 100/100 confidence percentage.
+- This is a precision filter, not a guarantee of higher future win rate. Actual win-rate improvement must be measured with out-of-sample backtesting using the same entry/exit rules.
+
+HOTFIX 2026-09-22 — MULTI-PAIR SCANNER + STRICT BACKTEST OPTIMIZATION
+- Forex scanner now evaluates a six-pair core watchlist by default: EURUSD, GBPUSD, USDJPY, GBPJPY, AUDUSD, USDCAD.
+- If another Forex symbol is selected, it is added to the monitored list when capacity allows; the scanner no longer requests only the selected pair.
+- Backend scans requested pairs concurrently and returns `pairs_scanned` plus `closest_pair`.
+- Closest monitored pair is ranked by confirmed-ready state first, then smallest distance to its planned entry zone, then setup strength.
+- Scanner UI shows multiple monitored pairs and explicitly identifies the nearest planned entry.
+- Added `/api/scanner/backtest`, which runs a compact historical parameter sweep across the six Forex pairs and 15m/1h/4h trigger timeframes.
+- Backtest configurations: strict 3/5 MTF + RSI 52–68 BUY / 32–48 SELL + structure/breakout + ATR 1R; very-strict 4/5 MTF + RSI 54–66 / 34–46; balanced 3/5 with 1.25R target.
+- Historical engine uses verified Yahoo candles and does NOT invent historical TradingView Recommend.All values. The UI labels results as historical validation, not guaranteed future win rate.
+- Backtest endpoint is run on demand with a longer frontend timeout so the scanner's normal live refresh remains fast.
