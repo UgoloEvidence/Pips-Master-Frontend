@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import base64, hashlib, hmac, json
 import os, random, secrets, sqlite3, time
@@ -500,7 +501,14 @@ def my_feedback(req: Request):
 
 def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
     trigger_timeframe = trigger_timeframe if trigger_timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m'
-    frames = {tf: fetch(symbol, tf) for tf in ('15m','30m','1h','4h','1d')}
+    # Load the context candles concurrently. This keeps the API responsive without
+    # changing which multi-timeframe frames are used by the scanner.
+    frame_names = ('15m','30m','1h','4h','1d')
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        jobs = {pool.submit(fetch, symbol, tf): tf for tf in frame_names}
+        frames = {}
+        for job in as_completed(jobs):
+            frames[jobs[job]] = job.result()
     trigger_rows = fetch(symbol, trigger_timeframe)
     setup = analyze_setup(trigger_rows, frames, trigger_timeframe)
     trends = {tf: trend_info(frames[tf]) for tf in frames}
