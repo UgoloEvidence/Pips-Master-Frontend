@@ -1,0 +1,12 @@
+PMA V4 UPDATE
+
+1. Replace frontend/ and backend/ in your existing pma_full_rebuilt folder.
+2. Keep your existing local data files out of Git.
+3. In Render Environment Variables, set PMA_ADMIN_EMAIL to your admin email and PMA_ADMIN_PASSWORD to your administrator password.
+4. Keep PMA_SECRET_KEY stable between deployments.
+5. Optional device notifications: set PMA_VAPID_PUBLIC_KEY, PMA_VAPID_PRIVATE_KEY and PMA_VAPID_SUBJECT in Render.
+6. Commit and push: git add frontend backend .gitignore && git commit -m "PMA V4 admin profile notifications" && git push origin main
+7. Vercel deploys frontend; Render deploys backend.
+8. Log in again after deployment so a fresh token is created.
+
+Admin-only behavior: the configured admin email is recognized on any device; it is not device-locked. Credentials remain server-side.

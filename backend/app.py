@@ -1,854 +1,290 @@
-from datetime import datetime, timedelta, timezone
-import base64, hashlib, hmac, json
-import os, random, secrets, sqlite3, time, re
-
-from fastapi import FastAPI, HTTPException, Request
+import os, sqlite3, secrets, hashlib, hmac, json, math
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+import requests
+import pandas as pd
+import numpy as np
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-import bcrypt
-try:
-    from pywebpush import webpush, WebPushException
-except Exception:
-    webpush = None
-    WebPushException = Exception
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
-from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso
+load_dotenv()
+DB=os.getenv('PMA_DB_PATH','pma.db')
+SECRET=os.getenv('PMA_SECRET_KEY','dev-only-change-me')
+ADMIN_EMAIL=os.getenv('PMA_ADMIN_EMAIL','').strip().lower()
+ADMIN_PASSWORD=os.getenv('PMA_ADMIN_PASSWORD','')
+ADMIN_USERNAME=os.getenv('PMA_ADMIN_USERNAME','PipsMaster')
+ADMIN_NAME=os.getenv('PMA_ADMIN_FULL_NAME','Ugolo Evidence')
+TOKEN_TTL=int(os.getenv('PMA_TOKEN_TTL','2592000'))
+QUAL_HOURS=int(os.getenv('PMA_REFERRAL_QUALIFICATION_HOURS','48'))
 
-ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').strip().lower()
-ADMIN_PASSWORD = os.getenv('PMA_ADMIN_PASSWORD', '').strip()
-ADMIN_USERNAME = os.getenv('PMA_ADMIN_USERNAME', 'PipsMaster').strip() or 'PipsMaster'
-ADMIN_FULL_NAME = os.getenv('PMA_ADMIN_FULL_NAME', 'Ugolo Evidence').strip() or 'PMA Administrator'
-TOKEN_SECRET = os.getenv('PMA_SECRET_KEY', '') or 'pma-dev-secret-change-this-in-render'
-TOKEN_TTL = int(os.getenv('PMA_TOKEN_TTL', str(60*60*24*30)))
-QUALIFICATION_HOURS = int(os.getenv('PMA_REFERRAL_QUALIFICATION_HOURS', '48'))
-VAPID_PUBLIC_KEY = os.getenv('PMA_VAPID_PUBLIC_KEY', '').strip()
-VAPID_PRIVATE_KEY = os.getenv('PMA_VAPID_PRIVATE_KEY', '').strip()
-VAPID_SUBJECT = os.getenv('PMA_VAPID_SUBJECT', 'mailto:ugoloevidence81@gmail.com').strip()
-DB = os.getenv('PMA_DB', 'pma.db')
-sessions = {}
-
-app = FastAPI(title='Pips Master Academy API', version='2.0')
+app=FastAPI(title='Pips Master Academy API', version='2.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
-RANKS = [
-    ('Beginner I', 0), ('Beginner II', 500), ('Beginner III', 1200), ('Beginner IV', 2100), ('Beginner V', 3500),
-    ('Amateur I', 5500), ('Amateur II', 8000), ('Amateur III', 11000), ('Amateur IV', 15000), ('Amateur V', 20000),
-    ('Professional I', 27000), ('Professional II', 36000), ('Professional III', 48000), ('Professional IV', 62000), ('Professional V', 80000),
-    ('Expert I', 100000), ('Expert II', 125000), ('Expert III', 155000), ('Expert IV', 190000), ('Expert V', 230000),
-    ('Master I', 275000), ('Master II', 325000), ('Master III', 385000), ('Master IV', 455000), ('Master V', 535000),
-    ('Pips Master', 650000),
-]
-
-LESSONS = [
-    {'id':'basics-01','course':'Forex Basics','title':'What is Forex?','xp':150},
-    {'id':'basics-02','course':'Forex Basics','title':'Currency pairs and pips','xp':150},
-    {'id':'charts-01','course':'Chart Reading','title':'Candlesticks','xp':175},
-    {'id':'charts-02','course':'Chart Reading','title':'Support and resistance','xp':175},
-    {'id':'structure-01','course':'Market Structure','title':'Higher highs and lower lows','xp':200},
-    {'id':'structure-02','course':'Market Structure','title':'Breaks of structure','xp':200},
-    {'id':'zones-01','course':'Supply & Demand','title':'Demand zones','xp':200},
-    {'id':'zones-02','course':'Supply & Demand','title':'Supply zones','xp':200},
-    {'id':'risk-01','course':'Risk Management','title':'Risk per trade','xp':225},
-    {'id':'risk-02','course':'Risk Management','title':'Position sizing','xp':225},
-    {'id':'risk-03','course':'Risk Management','title':'Risk-to-reward','xp':225},
-    {'id':'psych-01','course':'Trading Psychology','title':'Discipline and consistency','xp':225},
-    {'id':'analysis-01','course':'Technical Analysis','title':'Multi-timeframe analysis','xp':250},
-    {'id':'analysis-02','course':'Technical Analysis','title':'Momentum and confirmation','xp':250},
-    {'id':'journal-01','course':'Trading Journal','title':'Building a trade plan','xp':250},
-    {'id':'journal-02','course':'Trading Journal','title':'Reviewing your decisions','xp':250},
-]
-TASKS = [
-    {'id':'task-profile','title':'Complete your profile','xp':75},
-    {'id':'task-calculator','title':'Use the risk calculator','xp':50},
-    {'id':'task-read-basics','title':'Finish a beginner lesson','xp':50},
-    {'id':'task-multi-tf','title':'Review all five timeframes','xp':75},
-    {'id':'task-community','title':'Make a useful community post','xp':75},
-    {'id':'task-referral','title':'Share your referral link','xp':50},
-    {'id':'task-journal','title':'Write a personal trade-plan note','xp':100},
-    {'id':'task-risk-review','title':'Review your risk rules','xp':75},
-    {'id':'task-weekly-check','title':'Complete your weekly learning check','xp':100},
-    {'id':'task-challenge','title':'Complete a monthly learning challenge','xp':150},
-    {'id':'task-consistency','title':'Maintain a learning routine','xp':100},
-    {'id':'task-advanced','title':'Complete an advanced lesson','xp':200},
-]
-DAILY_TASKS = [
-    {'id':'daily-review-timeframes','title':'Review today’s 15m, 30m, 1H, 4H and 1D trends','xp':20},
-    {'id':'daily-lesson','title':'Complete one learning lesson','xp':30},
-    {'id':'daily-calculator','title':'Use one calculator tool with a practice example','xp':20},
-    {'id':'daily-journal','title':'Write one learning or trade-plan note','xp':25},
-    {'id':'daily-scanner-review','title':'Review one automated scanner setup','xp':20},
-    {'id':'daily-community','title':'Make one useful community contribution','xp':20},
-]
-REFERRAL_TARGETS = [{'position':1,'required_referrals':100},{'position':2,'required_referrals':80},{'position':3,'required_referrals':60}]
-
-
-class Signup(BaseModel):
-    username: str
-    full_name: str
-    email: EmailStr
-    password: str
-    confirm_password: str
-    referral: str = ''
-
-
-class Login(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class Msg(BaseModel):
-    text: str = ''
-    media_data: str = ''
-    media_type: str = ''
-
-
-class Profile(BaseModel):
-    full_name: str
-    username: str
-    phone: str = ''
-    dob: str = ''
-    profile_picture: str = ''
-
-
-class PasswordChange(BaseModel):
-    password: str
-
-
-class Completion(BaseModel):
-    item_id: str
-
-
-def hash_password(password):
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-
-def verify_password(password, stored_hash):
-    try:
-        return bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8'))
-    except Exception:
-        return False
-
+SCHEMA='''
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,full_name TEXT DEFAULT '',username TEXT DEFAULT '',phone TEXT DEFAULT '',dob TEXT DEFAULT '',profile_picture TEXT DEFAULT '',pma_id TEXT UNIQUE,referral_code TEXT UNIQUE,role TEXT DEFAULT 'user',xp INTEGER DEFAULT 0,rank TEXT DEFAULT 'Beginner I',theme TEXT DEFAULT 'dark',created_at TEXT,updated_at TEXT);
+CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id INTEGER,expires_at TEXT);
+CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,category TEXT,title TEXT,message TEXT,target TEXT,setup_id TEXT UNIQUE,created_at TEXT,read INTEGER DEFAULT 0,cleared INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS referrals(id INTEGER PRIMARY KEY AUTOINCREMENT,referrer_id INTEGER,referred_email TEXT,created_at TEXT,status TEXT DEFAULT 'pending',qualified_at TEXT);
+CREATE TABLE IF NOT EXISTS community_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,message TEXT,created_at TEXT,deleted INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,rating INTEGER,message TEXT,created_at TEXT,xp_awarded INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,title TEXT,done INTEGER DEFAULT 0,task_date TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS learning(user_id INTEGER PRIMARY KEY,lessons INTEGER DEFAULT 0,courses INTEGER DEFAULT 0,streak INTEGER DEFAULT 0,learning_percent REAL DEFAULT 0,overall_percent REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS preferences(user_id INTEGER PRIMARY KEY,trading_style TEXT DEFAULT 'Scalping',trigger_tf TEXT DEFAULT '5m',markets TEXT DEFAULT 'Forex',theme TEXT DEFAULT 'dark',signal_notifications INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS scanner_setups(id TEXT PRIMARY KEY,user_id INTEGER,symbol TEXT,market TEXT,direction TEXT,style TEXT,timeframe TEXT,confidence INTEGER,strength TEXT,entry REAL,sl REAL,tp1 REAL,tp2 REAL,status TEXT,reason TEXT,confirmations TEXT,created_at TEXT,triggered_at TEXT,closed_at TEXT);
+CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,payload TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS journal(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,note TEXT,created_at TEXT,updated_at TEXT);
+CREATE TABLE IF NOT EXISTS achievements(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,key TEXT,unlocked_at TEXT,UNIQUE(user_id,key));
+'''
 
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    c.execute('''CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY, username TEXT UNIQUE, full_name TEXT, email TEXT UNIQUE,
-        password TEXT, pma_id TEXT UNIQUE, referral_code TEXT UNIQUE, referrer TEXT,
-        role TEXT DEFAULT 'user', phone TEXT DEFAULT '', dob TEXT DEFAULT '', profile_picture TEXT DEFAULT '',
-        created INTEGER, xp INTEGER DEFAULT 0, last_active INTEGER DEFAULT 0, login_count INTEGER DEFAULT 0,
-        activity_count INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS messages(
-        id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '',
-        media_type TEXT DEFAULT '', created INTEGER
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS notifications(
-        id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0,
-        target_page TEXT DEFAULT '', target_ref TEXT DEFAULT ''
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS referrals(
-        id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, referred_id INTEGER NOT NULL,
-        challenge_month TEXT NOT NULL, status TEXT DEFAULT 'pending', created INTEGER NOT NULL,
-        qualification_due INTEGER NOT NULL, qualified_at INTEGER, flagged INTEGER DEFAULT 0,
-        reason TEXT DEFAULT '', UNIQUE(referrer_id,referred_id)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS lesson_progress(
-        user_id INTEGER NOT NULL, lesson_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
-        PRIMARY KEY(user_id,lesson_id)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS task_progress(
-        user_id INTEGER NOT NULL, task_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
-        PRIMARY KEY(user_id,task_id)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_task_progress(
-        user_id INTEGER NOT NULL, task_id TEXT NOT NULL, day TEXT NOT NULL, completed_at INTEGER NOT NULL,
-        PRIMARY KEY(user_id,task_id,day)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS feedback(
-        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, username TEXT NOT NULL, category TEXT NOT NULL,
-        rating INTEGER NOT NULL, message TEXT NOT NULL, created INTEGER NOT NULL, status TEXT DEFAULT 'new'
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS activity_log(
-        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, event_type TEXT NOT NULL, created INTEGER NOT NULL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS push_subscriptions(
-        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL,
-        p256dh TEXT NOT NULL, auth TEXT NOT NULL, created INTEGER NOT NULL, last_used INTEGER NOT NULL
-    )''')
-    # Small migrations for databases created by previous PMA versions.
-    notif_existing = {r['name'] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
-    for name, ddl in {
-        'target_page':'ALTER TABLE notifications ADD COLUMN target_page TEXT DEFAULT ''',
-        'target_ref':'ALTER TABLE notifications ADD COLUMN target_ref TEXT DEFAULT ''',
-    }.items():
-        if name not in notif_existing:
-            c.execute(ddl)
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
+    c.executescript(SCHEMA); return c
 
-    existing = {r['name'] for r in c.execute("PRAGMA table_info(users)").fetchall()}
-    for name, ddl in {
-        'xp':'ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0',
-        'last_active':'ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0',
-        'login_count':'ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0',
-        'activity_count':'ALTER TABLE users ADD COLUMN activity_count INTEGER DEFAULT 0',
-    }.items():
-        if name not in existing:
-            c.execute(ddl)
-    c.commit()
-    return c
+def now(): return datetime.now(timezone.utc).isoformat()
+def pwd_hash(p): return hashlib.sha256((SECRET+'|'+p).encode()).hexdigest()
+def make_token(uid):
+    raw=f'{uid}.{int(datetime.now(timezone.utc).timestamp())}.{secrets.token_urlsafe(18)}'
+    sig=hmac.new(SECRET.encode(),raw.encode(),hashlib.sha256).hexdigest()
+    return raw+'.'+sig
 
+def verify_token(t):
+    if not t: return None
+    parts=t.split('.')
+    if len(parts)<4: return None
+    raw='.'.join(parts[:-1]); sig=parts[-1]
+    good=hmac.compare_digest(sig,hmac.new(SECRET.encode(),raw.encode(),hashlib.sha256).hexdigest())
+    if not good: return None
+    try: uid=int(parts[0])
+    except: return None
+    c=db(); r=c.execute('SELECT * FROM sessions WHERE token=? AND expires_at>?',(t,now())).fetchone(); c.close()
+    return uid if r else None
 
-def month_key(ts=None):
-    return datetime.fromtimestamp(ts or time.time(), timezone.utc).strftime('%Y-%m')
+def auth(authorization:Optional[str]):
+    token=authorization.split(' ',1)[1] if authorization and authorization.lower().startswith('bearer ') else None
+    uid=verify_token(token)
+    if not uid: raise HTTPException(401,'Authentication required')
+    return uid
 
+def user(uid):
+    c=db(); r=c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); c.close()
+    if not r: raise HTTPException(404,'User not found')
+    return dict(r)
 
-def user_out(row):
-    return {
-        'username': row['username'], 'full_name': row['full_name'], 'email': row['email'],
-        'pma_id': row['pma_id'], 'referral_code': row['referral_code'], 'role': ('admin' if str(row['email']).lower() == ADMIN_EMAIL else row['role']),
-        'phone': row['phone'] or '', 'dob': row['dob'] or '', 'profile_picture': row['profile_picture'] or '',
-    }
+def admin(uid): return user(uid).get('role')=='admin'
+def rank_for(xp):
+    levels=[('Beginner I',0),('Beginner II',250),('Beginner III',600),('Beginner IV',1000),('Beginner V',1500),('Amateur I',2200),('Amateur II',3200),('Amateur III',4500),('Amateur IV',6000),('Amateur V',8000),('Professional I',10500),('Professional II',13500),('Professional III',17000),('Professional IV',21000),('Professional V',26000),('Expert',32000),('Master',40000),('Pips Master',50000)]
+    out=levels[0][0]
+    for name,need in levels:
+        if xp>=need: out=name
+    return out
 
-
-def referral_rank_for_count(count):
-    count = max(0, int(count or 0))
-    levels = [
-        ('Referral Newcomer', 0),
-        ('Referral Starter', 10),
-        ('Referral Builder', 25),
-        ('Referral Pro', 50),
-        ('Referral Champion', 80),
-        ('Referral Elite', 100),
-        ('Referral Legend', 250),
-    ]
-    current, current_min = levels[0]
-    next_name, next_min = None, None
-    for i, (name, threshold) in enumerate(levels):
-        if count >= threshold:
-            current, current_min = name, threshold
-            if i + 1 < len(levels):
-                next_name, next_min = levels[i + 1]
-        else:
-            break
-    progress = 100 if next_min is None else round(min(100, max(0, (count-current_min)/max(next_min-current_min,1)*100)), 1)
-    return {'referral_rank':current,'referral_rank_min':current_min,'next_referral_rank':next_name,'next_referral_count':next_min,'referral_rank_progress':progress}
-
-
-def rank_for_xp(xp):
-    current = RANKS[0][0]
-    current_min = RANKS[0][1]
-    next_name = None
-    next_min = None
-    for i, (name, threshold) in enumerate(RANKS):
-        if xp >= threshold:
-            current, current_min = name, threshold
-            if i + 1 < len(RANKS):
-                next_name, next_min = RANKS[i + 1]
-        else:
-            break
-    if next_min is None:
-        progress = 100
-    else:
-        progress = round(min(100, max(0, (xp - current_min) / max(next_min - current_min, 1) * 100)), 1)
-    return {'rank': current, 'rank_min_xp': current_min, 'next_rank': next_name, 'next_rank_xp': next_min, 'rank_progress': progress}
-
-
-def record_activity(c, user_id, event_type, xp=0):
-    now = int(time.time())
-    day = datetime.fromtimestamp(now, timezone.utc).strftime('%Y-%m-%d')
-    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)', (user_id,day,event_type,now))
-    c.execute('UPDATE users SET activity_count=COALESCE(activity_count,0)+1,last_active=?,xp=COALESCE(xp,0)+? WHERE id=?', (now,xp,user_id))
-
-
-def daily_streak(c, user_id):
-    days = [r['day'] for r in c.execute('SELECT DISTINCT day FROM activity_log WHERE user_id=? ORDER BY day DESC LIMIT 370',(user_id,)).fetchall()]
-    if not days: return 0
-    day_set = set(datetime.strptime(x,'%Y-%m-%d').date() for x in days)
-    today = datetime.now(timezone.utc).date()
-    if today not in day_set and (today - timedelta(days=1)) not in day_set:
-        return 0
-    cursor = today if today in day_set else today - timedelta(days=1)
-    streak = 0
-    while cursor in day_set:
-        streak += 1
-        cursor -= timedelta(days=1)
-    return streak
-
-
-def _token_pack(payload):
-    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(',', ':')).encode()).decode().rstrip('=')
-    sig = hmac.new(TOKEN_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
-    return body + '.' + sig
-
-
-def _token_unpack(token):
-    try:
-        body, sig = token.split('.', 1)
-        expected = hmac.new(TOKEN_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return None
-        raw = base64.urlsafe_b64decode(body + '=' * (-len(body) % 4))
-        payload = json.loads(raw.decode())
-        if int(payload.get('exp', 0)) < int(time.time()):
-            return None
-        return payload
-    except Exception:
-        return None
-
-
-def make_token(user_id):
-    return _token_pack({'uid': int(user_id), 'exp': int(time.time()) + TOKEN_TTL})
-
-
-def notification_target(typ):
-    return {
-        'referral':'referrals', 'community':'community', 'task':'progress',
-        'signal':'signals', 'account':'profile', 'security':'profile', 'learning':'progress', 'feedback':'feedback'
-    }.get(typ, 'home')
-
-
-def push_notice(c, username, title, text, typ='info', target_page=''):
-    page = target_page or notification_target(typ)
-    now = int(time.time())
-    c.execute('INSERT INTO notifications(username,title,text,type,created,read,target_page,target_ref) VALUES(?,?,?,?,?,?,?,?)',
-              (username,title,text,typ,now,0,page,''))
-    # Optional Web Push: works even when the PMA tab is not the active tab.
-    if webpush and VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY:
-        row = c.execute('SELECT id FROM users WHERE username=? LIMIT 1', (username,)).fetchone()
-        if row:
-            subs = c.execute('SELECT * FROM push_subscriptions WHERE user_id=?', (row['id'],)).fetchall()
-            payload = json.dumps({'title': title, 'body': text, 'type': typ, 'target_page': page})
-            for sub in subs:
-                subscription_info = {
-                    'endpoint': sub['endpoint'],
-                    'keys': {'p256dh': sub['p256dh'], 'auth': sub['auth']}
-                }
-                try:
-                    webpush(subscription_info=subscription_info, data=payload, vapid_private_key=VAPID_PRIVATE_KEY,
-                            vapid_claims={'sub': VAPID_SUBJECT})
-                    c.execute('UPDATE push_subscriptions SET last_used=? WHERE id=?', (now, sub['id']))
-                except Exception as exc:
-                    # Expired subscriptions are harmless; delete common 404/410 failures.
-                    msg = str(exc)
-                    if '404' in msg or '410' in msg or 'Gone' in msg:
-                        c.execute('DELETE FROM push_subscriptions WHERE id=?', (sub['id'],))
-
-
-def get_locked(c):
-    row = c.execute("SELECT value FROM settings WHERE key='community_locked'").fetchone()
-    return bool(row and row['value'] == '1')
-
-
-def set_locked(c, value):
-    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('community_locked',?)", ('1' if value else '0',))
-
-
-def current(req: Request):
-    token = req.headers.get('Authorization','').replace('Bearer ','').strip()
-    payload = _token_unpack(token)
-    if not payload:
-        raise HTTPException(401,'Please log in again.')
-    uid = payload.get('uid')
-    c = db(); row = c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
-    if not row:
-        c.close(); raise HTTPException(401,'Session expired.')
-    if is_admin_email(row['email']) and row['role'] != 'admin':
-        c.execute("UPDATE users SET role='admin' WHERE id=?",(uid,))
-        row = c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
-    c.execute('UPDATE users SET last_active=? WHERE id=?',(int(time.time()),uid)); c.commit(); c.close()
-    return row
-
-
-def resolve_referrer(c, referral):
-    value = (referral or '').strip()
-    if not value: return None
-    return c.execute('SELECT * FROM users WHERE lower(referral_code)=lower(?) OR lower(username)=lower(?) OR lower(pma_id)=lower(?) LIMIT 1',(value,value,value)).fetchone()
-
-
-def is_admin_email(email):
-    return str(email or '').strip().lower() == ADMIN_EMAIL
-
-
-def ensure_admin_row(c, password=''):
-    row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)', (ADMIN_EMAIL,)).fetchone()
-    if row:
-        if is_admin_email(row['email']) and row['role'] != 'admin':
-            c.execute("UPDATE users SET role='admin' WHERE id=?", (row['id'],))
-            row = c.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone()
-        if password and ADMIN_PASSWORD and password == ADMIN_PASSWORD and not verify_password(password, row['password']):
-            c.execute("UPDATE users SET password=?,role='admin' WHERE id=?", (hash_password(password), row['id']))
-            row = c.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone()
-        return row
-    if not (ADMIN_PASSWORD and password == ADMIN_PASSWORD):
-        return None
-    username = ADMIN_USERNAME
-    base = username
-    n = 2
-    while c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?)', (username,)).fetchone():
-        username = f'{base}{n}'
-        n += 1
-    pma = 'PMA-ADMIN001'
-    if c.execute('SELECT 1 FROM users WHERE pma_id=?', (pma,)).fetchone():
-        pma = f'PMA-ADMIN-{secrets.token_hex(3).upper()}'
-    code = pma.replace('-', '')
-    now = int(time.time())
-    c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-              (username, ADMIN_FULL_NAME, ADMIN_EMAIL, hash_password(password), pma, code, '', 'admin', now, 0, now, 0, 1))
-    uid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
-    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',
-              (uid, datetime.fromtimestamp(now, timezone.utc).strftime('%Y-%m-%d'), 'admin_bootstrap', now))
-    push_notice(c, username, 'Administrator account ready', 'Your PMA administrator account is ready.', 'account', 'profile')
-    return c.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
-
-
-def qualify_referrals(c):
-    now = int(time.time())
-    rows = c.execute("SELECT r.*,u.username AS referred_username,u.email AS referred_email,u.login_count,u.activity_count,u.last_active,ref.username AS referrer_username FROM referrals r JOIN users u ON u.id=r.referred_id JOIN users ref ON ref.id=r.referrer_id WHERE r.status='pending' AND r.qualification_due<=? ORDER BY r.id",(now,)).fetchall()
-    for r in rows:
-        genuine_activity = (r['login_count'] or 0) >= 1 and (r['activity_count'] or 0) >= 2 and (r['last_active'] or 0) > r['created']
-        if genuine_activity:
-            c.execute('UPDATE referrals SET status="qualified",qualified_at=? WHERE id=?',(now,r['id']))
-            c.execute('UPDATE users SET xp=COALESCE(xp,0)+25 WHERE id=?',(r['referrer_id'],))
-            push_notice(c, r['referrer_username'], 'Referral qualified', f"{r['referred_username']} is now a qualified referral.", 'referral') if 'referrer_username' in r.keys() else None
-        else:
-            # Keep it pending; the qualification check can run again after the member becomes active.
-            c.execute('UPDATE referrals SET qualification_due=? WHERE id=?',(now + 24*3600,r['id']))
-    c.commit()
-
+class Login(BaseModel): email:str; password:str
+class Register(BaseModel): email:str; password:str; full_name:str=''; username:str=''; referral_code:str=''
+class ProfileUpdate(BaseModel): full_name:str=''; username:str=''; phone:str=''; dob:str=''; profile_picture:str=''; password:str=''
+class Prefs(BaseModel): trading_style:str='Scalping'; trigger_tf:str='5m'; markets:str='Forex'; theme:str='dark'; signal_notifications:bool=True
+class Message(BaseModel): message:str=Field(min_length=1,max_length=2000)
+class FeedbackIn(BaseModel): rating:int=Field(ge=1,le=5); message:str=Field(min_length=1,max_length=2000)
+class TaskDone(BaseModel): done:bool=True
 
 @app.on_event('startup')
-def startup_prepare():
-    c = db()
-    if ADMIN_PASSWORD:
-        ensure_admin_row(c, ADMIN_PASSWORD)
-    c.close()
-
+def startup():
+    c=db()
+    if ADMIN_EMAIL and ADMIN_PASSWORD:
+        r=c.execute('SELECT id FROM users WHERE email=?',(ADMIN_EMAIL,)).fetchone()
+        if not r:
+            code='PMAADMIN001'
+            c.execute('INSERT INTO users(email,password_hash,full_name,username,pma_id,referral_code,role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(ADMIN_EMAIL,pwd_hash(ADMIN_PASSWORD),ADMIN_NAME,ADMIN_USERNAME,'PMA-ADMIN001',code,'admin',now(),now()))
+        else:
+            c.execute("UPDATE users SET password_hash=?,role='admin',full_name=?,username=? WHERE email=?",(pwd_hash(ADMIN_PASSWORD),ADMIN_NAME,ADMIN_USERNAME,ADMIN_EMAIL))
+    c.commit(); c.close()
 
 @app.get('/api/health')
-def health():
-    return {'ok':True,'service':'pma-api','time':utc_iso()}
+def health(): return {'ok':True,'service':'PMA API','time':now()}
 
-
-@app.post('/api/auth/signup')
-def signup(x: Signup):
-    if x.password != x.confirm_password: raise HTTPException(400,'Passwords do not match.')
-    if len(x.password) < 8: raise HTTPException(400,'Password must be at least 8 characters.')
-    c = db()
-    if c.execute('SELECT 1 FROM users WHERE lower(email)=lower(?)',(str(x.email),)).fetchone():
-        c.close(); raise HTTPException(400,'That email is already registered. Please log in.')
-    if c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?)',(x.username.strip(),)).fetchone():
-        c.close(); raise HTTPException(400,'That username is already in use.')
-    pma = f'PMA-{random.randint(100000,999999)}'
-    while c.execute('SELECT 1 FROM users WHERE pma_id=?',(pma,)).fetchone():
-        pma = f'PMA-{random.randint(100000,999999)}'
-    role = 'admin' if str(x.email).lower() == ADMIN_EMAIL.lower() else 'user'
-    now = int(time.time())
-    referrer = resolve_referrer(c, x.referral)
-    c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-              (x.username.strip(),x.full_name.strip(),str(x.email).lower(),hash_password(x.password),pma,pma.replace('-',''),referrer['username'] if referrer else '',role,now,0,now,0,1))
-    uid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
-    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(uid,datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'signup',now))
-    if referrer and referrer['id'] != uid:
-        c.execute('INSERT OR IGNORE INTO referrals(referrer_id,referred_id,challenge_month,status,created,qualification_due) VALUES(?,?,?,?,?,?)',
-                  (referrer['id'],uid,month_key(now),'pending',now,now + QUALIFICATION_HOURS*3600))
-        push_notice(c, referrer['username'], 'New referral', f"{x.username} joined through your referral link. It is pending qualification.", 'referral')
-    row = c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
-    push_notice(c,row['username'],'Welcome to Pips Master Academy','Your account was created successfully.','account')
-    c.commit(); c.close()
-    token = make_token(uid)
-    return {'user':user_out(row),'token':token}
-
+@app.post('/api/auth/register')
+def register(x:Register):
+    c=db(); email=x.email.strip().lower()
+    if c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone(): raise HTTPException(409,'Email already registered')
+    code='PMA'+secrets.token_hex(4).upper()
+    c.execute('INSERT INTO users(email,password_hash,full_name,username,pma_id,referral_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)',(email,pwd_hash(x.password),x.full_name,x.username,'PMA-'+secrets.token_hex(4).upper(),code,now(),now()))
+    uid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+    c.execute('INSERT INTO learning(user_id) VALUES(?)',(uid,)); c.execute('INSERT INTO preferences(user_id) VALUES(?)',(uid,)); c.commit()
+    if x.referral_code:
+        ref=c.execute('SELECT id FROM users WHERE referral_code=?',(x.referral_code.strip().upper(),)).fetchone()
+        if ref: c.execute('INSERT INTO referrals(referrer_id,referred_email,created_at,status) VALUES(?,?,?,?)',(ref['id'],email,now(),'pending')); c.commit()
+    token=make_token(uid); exp=(datetime.now(timezone.utc)+timedelta(seconds=TOKEN_TTL)).isoformat(); c.execute('INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)',(token,uid,exp)); c.commit(); c.close()
+    return {'token':token,'user':user(uid)}
 
 @app.post('/api/auth/login')
-def login(x: Login):
-    email = str(x.email).strip().lower()
-    c = db()
-    row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)', (email,)).fetchone()
-    if is_admin_email(email):
-        # The designated admin email is never device-locked. Each successful login creates a fresh signed token.
-        if ADMIN_PASSWORD and x.password == ADMIN_PASSWORD:
-            row = ensure_admin_row(c, x.password)
-        elif row and verify_password(x.password, row['password']):
-            # Existing admin row can still authenticate from any device.
-            c.execute("UPDATE users SET role='admin' WHERE id=?", (row['id'],))
-            row = c.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone()
-        elif not row:
-            c.close(); raise HTTPException(503, 'Administrator account is not initialized. Set PMA_ADMIN_PASSWORD in Render and redeploy the backend once.')
-        else:
-            c.close(); raise HTTPException(401, 'Administrator email is recognized, but the password is incorrect.')
-    elif not row or not verify_password(x.password, row['password']):
-        c.close(); raise HTTPException(401,'Email or password is incorrect.')
-    if not row:
-        c.close(); raise HTTPException(500,'Administrator account could not be prepared.')
-    if is_admin_email(row['email']) and row['role'] != 'admin':
-        c.execute("UPDATE users SET role='admin' WHERE id=?", (row['id'],))
-        row = c.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone()
-    now = int(time.time())
-    c.execute('UPDATE users SET last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,row['id']))
-    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
-    push_notice(c,row['username'],'New login','Your account was signed in successfully.','security','profile')
-    c.commit(); c.close()
-    return {'user':user_out(row),'token':make_token(row['id'])}
+def login(x:Login):
+    c=db(); r=c.execute('SELECT * FROM users WHERE email=? AND password_hash=?',(x.email.strip().lower(),pwd_hash(x.password))).fetchone()
+    if not r: c.close(); raise HTTPException(401,'Invalid email or password')
+    token=make_token(r['id']); exp=(datetime.now(timezone.utc)+timedelta(seconds=TOKEN_TTL)).isoformat(); c.execute('INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)',(token,r['id'],exp)); c.commit(); c.close(); return {'token':token,'user':user(r['id'])}
 
+@app.get('/api/me')
+def me(authorization:Optional[str]=Header(None)): return user(auth(authorization))
 
-@app.post('/api/auth/logout')
-def logout(req: Request):
-    # Tokens are signed and expire automatically; logout is handled client-side.
-    return {'ok':True}
+@app.put('/api/profile')
+def profile(x:ProfileUpdate,authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); u=user(uid); fields=['full_name=?','username=?','phone=?','dob=?','profile_picture=?']; vals=[x.full_name,x.username,x.phone,x.dob,x.profile_picture]
+    if x.password: fields.append('password_hash=?'); vals.append(pwd_hash(x.password))
+    vals += [now(),uid]; c.execute('UPDATE users SET '+','.join(fields)+',updated_at=? WHERE id=?',vals); c.commit(); c.close(); return user(uid)
 
-
-@app.get('/api/auth/profile')
-def get_profile(req: Request):
-    u=current(req); return {'user':user_out(u)}
-
-
-@app.put('/api/auth/profile')
-def update_profile(req: Request, x: Profile):
-    u=current(req); c=db()
-    full_name=x.full_name.strip()[:120]
-    new_username=x.username.strip()[:40]
-    if not full_name:
-        c.close(); raise HTTPException(400,'Full name cannot be empty.')
-    if not re.match(r'^[A-Za-z0-9_.-]{3,40}$', new_username):
-        c.close(); raise HTTPException(400,'Username must be 3-40 characters and use letters, numbers, underscore, dot or hyphen.')
-    if c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?) AND id<>?',(new_username,u['id'])).fetchone():
-        c.close(); raise HTTPException(400,'That username is already in use.')
-    old_username=u['username']
-    c.execute('UPDATE users SET full_name=?,username=?,phone=?,dob=?,profile_picture=?,last_active=? WHERE id=?',
-              (full_name,new_username,x.phone.strip()[:40],x.dob or '',x.profile_picture or '',int(time.time()),u['id']))
-    c.execute('UPDATE notifications SET username=? WHERE username=?',(new_username,old_username))
-    push_notice(c,new_username,'Profile saved','Your profile changes were saved successfully.','account','profile')
-    c.commit()
-    row=c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone(); c.close()
-    return {'user':user_out(row)}
-
-
-@app.put('/api/auth/password')
-def change_password(req: Request, x: PasswordChange):
-    u=current(req)
-    if len(x.password) < 8: raise HTTPException(400,'Password must be at least 8 characters.')
-    c=db(); c.execute('UPDATE users SET password=? WHERE id=?',(hash_password(x.password),u['id'])); push_notice(c,u['username'],'Password updated','Your password was updated successfully.','security'); c.commit(); c.close(); return {'ok':True}
-
-
-class PushSubscription(BaseModel):
-    endpoint: str
-    keys: dict
-
-
-@app.get('/api/push/config')
-def push_config(req: Request):
-    current(req)
-    return {'enabled': bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY), 'public_key': VAPID_PUBLIC_KEY}
-
-
-@app.post('/api/push/subscribe')
-def push_subscribe(req: Request, x: PushSubscription):
-    u = current(req)
-    endpoint = str(x.endpoint or '').strip()
-    p256dh = str((x.keys or {}).get('p256dh') or '').strip()
-    auth = str((x.keys or {}).get('auth') or '').strip()
-    if not endpoint or not p256dh or not auth:
-        raise HTTPException(400, 'Push subscription is incomplete.')
-    c = db(); now = int(time.time())
-    c.execute('''INSERT INTO push_subscriptions(user_id,endpoint,p256dh,auth,created,last_used)
-                 VALUES(?,?,?,?,?,?)
-                 ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,last_used=excluded.last_used''',
-              (u['id'], endpoint, p256dh, auth, now, now))
-    c.commit(); c.close()
-    return {'ok': True}
-
-
-@app.delete('/api/push/subscribe')
-def push_unsubscribe(req: Request, x: PushSubscription):
-    u = current(req); c = db(); c.execute('DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?',(u['id'],x.endpoint)); c.commit(); c.close(); return {'ok': True}
-
-
-@app.get('/api/notifications')
-def notifications(req: Request):
-    u=current(req); c=db(); rows=c.execute('SELECT * FROM notifications WHERE username=? ORDER BY id DESC LIMIT 200',(u['username'],)).fetchall(); c.close()
-    return {'notifications':[{'id':r['id'],'title':r['title'],'text':r['text'],'type':r['type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'read':bool(r['read']),'target_page':r['target_page'] or notification_target(r['type']),'target_ref':r['target_ref'] or ''} for r in rows]}
-
-
-class NotificationRead(BaseModel):
-    notification_id: int
-
-
-@app.post('/api/notifications/read-one')
-def notifications_read_one(req: Request, x: NotificationRead):
-    u=current(req); c=db()
-    row=c.execute('SELECT id FROM notifications WHERE id=? AND username=?',(x.notification_id,u['username'])).fetchone()
-    if not row:
-        c.close(); raise HTTPException(404,'Notification not found.')
-    c.execute('UPDATE notifications SET read=1 WHERE id=? AND username=?',(x.notification_id,u['username']))
-    c.commit(); c.close(); return {'ok':True}
-
-
-@app.post('/api/notifications/read')
-def notifications_read(req: Request):
-    u=current(req); c=db(); c.execute('UPDATE notifications SET read=1 WHERE username=?',(u['username'],)); c.commit(); c.close(); return {'ok':True}
-
-
-class Feedback(BaseModel):
-    category: str = 'General'
-    rating: int = 5
-    message: str
-
-
-@app.post('/api/feedback')
-def submit_feedback(req: Request, x: Feedback):
-    u=current(req)
-    message=x.message.strip()
-    if not message:
-        raise HTTPException(400,'Please write your feedback before sending.')
-    rating=max(1,min(5,int(x.rating)))
-    category=(x.category or 'General').strip()[:40]
-    c=db(); now=int(time.time())
-    c.execute('INSERT INTO feedback(user_id,username,category,rating,message,created,status) VALUES(?,?,?,?,?,?,?)',
-              (u['id'],u['username'],category,rating,message,now,'new'))
-    record_activity(c,u['id'],'feedback_submit',0)
-    push_notice(c,u['username'],'Feedback received','Thanks — your feedback was saved to your PMA account.','feedback')
-    c.commit(); c.close()
-    return {'ok':True}
-
-
-@app.get('/api/feedback')
-def my_feedback(req: Request):
-    u=current(req); c=db(); rows=c.execute('SELECT category,rating,message,created,status FROM feedback WHERE user_id=? ORDER BY id DESC LIMIT 20',(u['id'],)).fetchall(); c.close()
-    return {'feedback':[{'category':r['category'],'rating':r['rating'],'message':r['message'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'status':r['status']} for r in rows]}
-
-
-def prepare_market_setup(symbol, market):
-    frames = {tf: fetch(symbol, tf) for tf in ('15m','30m','1h','4h','1d')}
-    setup = analyze_setup(frames['15m'], frames)
-    trends = {tf: trend_info(frames[tf]) for tf in frames}
-    validation = backtest(frames['15m'])
-    psize = pip_size(symbol)
-    reasons = setup.get('reasons', [])
-    if setup['direction'] != 'NO TRADE':
-        reasons = reasons or ['Automated confluence conditions are being monitored.']
-    return {
-        'symbol':symbol.upper(),'market':market,'direction':setup['direction'],'setup_strength':setup['score'],'status':setup['status'],
-        'entry_zone':round(setup['entry_zone'],8) if setup['entry_zone'] is not None else None,
-        'entry_note':'Use the zone as a planning area, not an exact guaranteed fill.',
-        'stop_loss':round(setup['stop_loss'],8) if setup['stop_loss'] is not None else None,
-        'take_profit_1':round(setup['take_profit_1'],8) if setup['take_profit_1'] is not None else None,
-        'take_profit_2':round(setup['take_profit_2'],8) if setup['take_profit_2'] is not None else None,
-        'risk_reward':'1:1 / 1:2 target framework' if setup['direction'] != 'NO TRADE' else '—',
-        'zone_type':setup.get('next_zone_type'),'next_zone':round(setup['next_zone'],8) if setup['next_zone'] is not None else None,
-        'distance_to_next_zone':round(setup['distance_to_next_zone'],8) if setup['distance_to_next_zone'] is not None else None,
-        'pips_to_next_zone':round((setup['distance_to_next_zone']/psize),1) if setup['distance_to_next_zone'] is not None else None,
-        'candles_to_next_zone':setup.get('candles_to_next_zone'),'estimated_minutes_to_next_zone':setup.get('estimated_minutes_to_next_zone'),
-        'timeframe':'15m','atr_15m':round(setup['atr'],8),'last':round(setup['last'],8),'support':round(setup['support'],8),'resistance':round(setup['resistance'],8),
-        'rsi_15m':setup['rsi'],'structure':setup['structure'],'trigger_price':round(setup['trigger_price'],8) if setup['trigger_price'] is not None else None,
-        'next_signal_status':'TRIGGERED' if setup['score'] >= 65 else 'WAITING FOR CONFIRMATION',
-        'next_signal_trigger':setup['trigger_text'],'reasons':reasons,
-        'trends':{tf:trends[tf]['trend'] for tf in trends},'trend_detail':trends,'trend_alignment':f"{sum(1 for v in trends.values() if v['trend']==setup['trend'])}/5",
-        'validation':validation,'data_source':'Yahoo Finance verified chart feed','updated_at':utc_iso(),'method':'PMA confluence engine: EMA trend + RSI + structure + multi-timeframe alignment + ATR zone projection'
-    }
-
-
-@app.get('/api/signals/scan')
-def scan(market: str='Forex', symbols: str='EURUSD'):
-    requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:20]
-    opportunities=[]; errors=[]
-    for sym in requested:
-        try:
-            opportunities.append(prepare_market_setup(sym,market))
-        except Exception as ex:
-            errors.append({'symbol':sym,'error':str(ex)})
-    # Prioritise actual ready setups, then the closest next-zone estimate.
-    opportunities.sort(key=lambda x:(0 if x['direction']!='NO TRADE' else 1, x['estimated_minutes_to_next_zone'] if x['estimated_minutes_to_next_zone'] is not None else 10**9, -(x['setup_strength'] or 0)))
-    return {
-        'closest':opportunities[0] if opportunities else None,
-        'opportunities':opportunities,'errors':errors,'market':market,'symbols':requested,
-        'message':'Verified candle data loaded.' if opportunities else 'No verified candle data was returned; no signal is being invented.',
-        'updated_at':utc_iso()
-    }
-
-
-@app.get('/api/signals/candles')
-def candles(symbol: str='EURUSD', timeframe: str='15m'):
-    try:
-        return {'symbol':symbol.upper(),'timeframe':timeframe,'candles':fetch(symbol,timeframe)[-300:],'updated_at':utc_iso()}
-    except Exception as ex:
-        raise HTTPException(503,f'Live candle feed unavailable: {ex}')
-
-
-@app.get('/api/day-trade/plan')
-def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJPY,XAUUSD,BTCUSD'):
-    requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:15]
-    results=[]; errors=[]
-    for sym in requested:
-        try:
-            setup=prepare_market_setup(sym,market)
-            # Day-trade focus: 15m trigger with 1h/4h context.
-            context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
-            setup['day_trade_state']='READY' if context_ok and setup['setup_strength']>=60 else 'WAITING'
-            setup['day_trade_reason']='15m trigger is aligned with 1h and 4h context.' if context_ok else 'Wait for cleaner 1h/4h confirmation.'
-            results.append(setup)
-        except Exception as ex:
-            errors.append({'symbol':sym,'error':str(ex)})
-    results.sort(key=lambda x:(0 if x['day_trade_state']=='READY' else 1,-(x['setup_strength'] or 0)))
-    return {'date':datetime.now(timezone.utc).strftime('%Y-%m-%d'),'market':market,'setups':results,'errors':errors,'updated_at':utc_iso(),'note':'Day-trade projections are estimates based on verified candle data; future price movement is not guaranteed.'}
-
-
-@app.get('/api/referrals')
-def referrals(req: Request, month: str=''):
-    u=current(req); c=db(); qualify_referrals(c)
-    mk=month or month_key()
-    rows=c.execute('SELECT * FROM referrals WHERE referrer_id=? ORDER BY id DESC',(u['id'],)).fetchall()
-    qualified=[r for r in rows if r['status']=='qualified']
-    month_rows=[r for r in qualified if r['challenge_month']==mk]
-    pending=[r for r in rows if r['status']=='pending']
-    total=len(qualified); month_count=len(month_rows); pending_count=len(pending)
-    leaderboard=c.execute('''SELECT u.username,u.full_name,u.profile_picture,COUNT(r.id) AS qualified
-        FROM referrals r JOIN users u ON u.id=r.referrer_id
-        WHERE r.challenge_month=? AND r.status='qualified'
-        GROUP BY r.referrer_id ORDER BY qualified DESC, MIN(r.qualified_at) ASC LIMIT 50''',(mk,)).fetchall()
-    rank=1
-    for idx,row in enumerate(leaderboard):
-        if row['username']==u['username']: rank=idx+1; break
-    c.commit(); c.close()
-    referral_rank = referral_rank_for_count(total)
-    return {
-        'month':mk,'qualified_total':total,'month_qualified':month_count,'pending':pending_count,
-        'position':rank if leaderboard else None,'challenge_targets':REFERRAL_TARGETS,
-        **referral_rank,
-        'monthly_leaderboard':[{'rank':i+1,'username':r['username'],'full_name':r['full_name'],'profile_picture':r['profile_picture'] or '','qualified':r['qualified']} for i,r in enumerate(leaderboard)],
-        'history':[{'challenge_month':r['challenge_month'],'status':r['status'],'created':r['created'],'qualified_at':r['qualified_at']} for r in rows[:100]],
-        'qualification_policy':f'Referrals are recorded immediately as pending and reviewed automatically after about {QUALIFICATION_HOURS} hours plus basic account activity.',
-        'rank_policy':'Qualified referrals contribute XP to your permanent academy rank and also increase your separate referral rank.'
-    }
-
-
-@app.get('/api/leaderboard')
-def leaderboard(req: Request, month: str=''):
-    u=current(req); c=db(); qualify_referrals(c); mk=month or month_key()
-    rows=c.execute('''SELECT u.username,u.full_name,u.profile_picture,u.xp,COUNT(r.id) AS qualified
-        FROM users u LEFT JOIN referrals r ON r.referrer_id=u.id AND r.challenge_month=? AND r.status='qualified'
-        GROUP BY u.id ORDER BY u.xp DESC, qualified DESC LIMIT 100''',(mk,)).fetchall()
-    out=[]
-    for i,r in enumerate(rows):
-        rank=rank_for_xp(r['xp'] or 0)
-        out.append({'rank':i+1,'username':r['username'],'full_name':r['full_name'],'profile_picture':r['profile_picture'] or '', 'xp':r['xp'] or 0, 'academy_rank':rank['rank'],'monthly_referrals':r['qualified'] or 0})
-    c.close(); return {'month':mk,'leaderboard':out,'factors':['qualified referrals','completed tasks','learning progress','long-term activity and consistency'],'note':'Academy rank is permanent XP progress; the monthly referral challenge is separate.'}
-
+@app.get('/api/preferences')
+def get_prefs(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); r=c.execute('SELECT * FROM preferences WHERE user_id=?',(uid,)).fetchone(); c.close(); return dict(r)
+@app.put('/api/preferences')
+def set_prefs(x:Prefs,authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); c.execute('INSERT INTO preferences(user_id,trading_style,trigger_tf,markets,theme,signal_notifications) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET trading_style=excluded.trading_style,trigger_tf=excluded.trigger_tf,markets=excluded.markets,theme=excluded.theme,signal_notifications=excluded.signal_notifications',(uid,x.trading_style,x.trigger_tf,x.markets,x.theme,int(x.signal_notifications))); c.execute('UPDATE users SET theme=? WHERE id=?',(x.theme,uid)); c.commit(); c.close(); return {'ok':True}
 
 @app.get('/api/progress')
-def progress(req: Request):
-    u=current(req); c=db(); qualify_referrals(c)
-    user=c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone()
-    completed_lessons=c.execute('SELECT lesson_id FROM lesson_progress WHERE user_id=?',(u['id'],)).fetchall()
-    completed_tasks=c.execute('SELECT task_id FROM task_progress WHERE user_id=?',(u['id'],)).fetchall()
-    today=datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    completed_daily=c.execute('SELECT task_id FROM daily_task_progress WHERE user_id=? AND day=?',(u['id'],today)).fetchall()
-    lifetime_refs=c.execute("SELECT COUNT(*) AS n FROM referrals WHERE referrer_id=? AND status='qualified'",(u['id'],)).fetchone()['n']
-    monthly_refs=c.execute("SELECT COUNT(*) AS n FROM referrals WHERE referrer_id=? AND status='qualified' AND challenge_month=?",(u['id'],month_key())).fetchone()['n']
-    streak=daily_streak(c,u['id'])
-    rank=rank_for_xp(user['xp'] or 0)
-    learning_pct=round(len(completed_lessons)/len(LESSONS)*100,1)
-    tasks_pct=round(len(completed_tasks)/len(TASKS)*100,1)
-    referral_pct=round(min(100,lifetime_refs/250*100),1)
-    consistency_pct=round(min(100,streak/30*100),1)
-    overall=round(learning_pct*0.45+tasks_pct*0.25+referral_pct*0.20+consistency_pct*0.10,1)
-    referral_rank = referral_rank_for_count(lifetime_refs)
-    c.close()
-    return {
-        'xp':user['xp'] or 0,**rank,'overall_progress':overall,'learning_progress':learning_pct,'tasks_progress':tasks_pct,
-        'referral_progress':referral_pct,'consistency_progress':consistency_pct,'streak':streak,
-        'completed_lessons':len(completed_lessons),'total_lessons':len(LESSONS),'completed_tasks':len(completed_tasks),'total_tasks':len(TASKS),'completed_daily_tasks':len(completed_daily),'total_daily_tasks':len(DAILY_TASKS),
-        'qualified_referrals_lifetime':lifetime_refs,'qualified_referrals_this_month':monthly_refs,
-        'levels_are_long_term':True,'rank_factors':['qualified referrals','completed tasks','learning progress','overall progress/consistency'],
-        'lessons':LESSONS,'tasks':TASKS,'daily_tasks':DAILY_TASKS,'completed_daily_task_ids':[r['task_id'] for r in completed_daily],
-    }
+def progress(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); u=user(uid); c=db(); l=c.execute('SELECT * FROM learning WHERE user_id=?',(uid,)).fetchone(); done=c.execute("SELECT COUNT(*) n FROM tasks WHERE user_id=? AND done=1",(uid,)).fetchone()['n']; total=c.execute('SELECT COUNT(*) n FROM tasks WHERE user_id=?',(uid,)).fetchone()['n']; refs=c.execute("SELECT COUNT(*) n FROM referrals WHERE referrer_id=? AND status='qualified'",(uid,)).fetchone()['n']; pend=c.execute("SELECT COUNT(*) n FROM referrals WHERE referrer_id=? AND status='pending'",(uid,)).fetchone()['n']; c.close(); return {'xp':u['xp'],'rank':rank_for(u['xp']),'learning_percent':l['learning_percent'],'overall_percent':l['overall_percent'],'streak':l['streak'],'tasks_done':done,'tasks_total':total,'qualified_referrals':refs,'pending_referrals':pend}
 
-
-@app.post('/api/progress/lesson')
-def complete_lesson(req: Request, x: Completion):
-    u=current(req); lesson=next((i for i in LESSONS if i['id']==x.item_id),None)
-    if not lesson: raise HTTPException(404,'Lesson not found.')
-    c=db(); exists=c.execute('SELECT 1 FROM lesson_progress WHERE user_id=? AND lesson_id=?',(u['id'],x.item_id)).fetchone()
-    if not exists:
-        c.execute('INSERT INTO lesson_progress(user_id,lesson_id,completed_at) VALUES(?,?,?)',(u['id'],x.item_id,int(time.time())))
-        record_activity(c,u['id'],'lesson_complete',lesson['xp'])
-        push_notice(c,u['username'],'Lesson completed',f"You completed: {lesson['title']}.",'learning')
-    c.commit(); c.close(); return {'ok':True,'new_completion':not bool(exists),'item':lesson}
-
-
-@app.post('/api/progress/daily-task')
-def complete_daily_task(req: Request, x: Completion):
-    u=current(req); task=next((i for i in DAILY_TASKS if i['id']==x.item_id),None)
-    if not task: raise HTTPException(404,'Daily task not found.')
-    day=datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    c=db(); exists=c.execute('SELECT 1 FROM daily_task_progress WHERE user_id=? AND task_id=? AND day=?',(u['id'],x.item_id,day)).fetchone()
-    if not exists:
-        c.execute('INSERT INTO daily_task_progress(user_id,task_id,day,completed_at) VALUES(?,?,?,?)',(u['id'],x.item_id,day,int(time.time())))
-        record_activity(c,u['id'],'daily_task_complete',task['xp'])
-        push_notice(c,u['username'],'Daily task completed',f"You completed: {task['title']}.",'task')
-    c.commit(); c.close(); return {'ok':True,'new_completion':not bool(exists),'item':task}
-
-
-@app.post('/api/progress/task')
-def complete_task(req: Request, x: Completion):
-    u=current(req); task=next((i for i in TASKS if i['id']==x.item_id),None)
-    if not task: raise HTTPException(404,'Task not found.')
-    c=db(); exists=c.execute('SELECT 1 FROM task_progress WHERE user_id=? AND task_id=?',(u['id'],x.item_id)).fetchone()
-    if not exists:
-        c.execute('INSERT INTO task_progress(user_id,task_id,completed_at) VALUES(?,?,?)',(u['id'],x.item_id,int(time.time())))
-        record_activity(c,u['id'],'task_complete',task['xp'])
-        push_notice(c,u['username'],'Task completed',f"You completed: {task['title']}.",'task')
-    c.commit(); c.close(); return {'ok':True,'new_completion':not bool(exists),'item':task}
-
-
-@app.get('/api/community/messages')
-def get_messages(req: Request):
-    current(req); c=db(); rows=c.execute('SELECT * FROM messages ORDER BY id ASC LIMIT 300').fetchall(); is_locked=get_locked(c); c.close()
-    return {'locked':is_locked,'messages':[{'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M')} for r in rows]}
-
-
-@app.post('/api/community/messages')
-def post_message(req: Request, x: Msg):
-    u=current(req); c=db(); is_locked=get_locked(c)
-    if is_locked and u['role']!='admin': c.close(); raise HTTPException(403,'Community chat is locked by the administrator.')
-    if not x.text.strip() and not x.media_data: c.close(); raise HTTPException(400,'Message cannot be empty.')
-    now=int(time.time())
-    c.execute('INSERT INTO messages(username,pma_id,text,media_data,media_type,created) VALUES(?,?,?,?,?,?)',(u['username'],u['pma_id'],x.text,x.media_data,x.media_type,now))
-    record_activity(c,u['id'],'community_post',10)
-    users=c.execute('SELECT username FROM users WHERE username<>?',(u['username'],)).fetchall()
-    for r in users: push_notice(c,r['username'],'New community message',f"{u['username']} posted in the community.",'community')
+@app.get('/api/tasks')
+def tasks(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); d=datetime.now(timezone.utc).date().isoformat(); c=db(); n=c.execute('SELECT COUNT(*) n FROM tasks WHERE user_id=? AND task_date=?',(uid,d)).fetchone()['n']
+    if not n:
+        for t in ['Review 15m / 30m / 1H / 4H / 1D trends','Complete one academy lesson','Use a calculator with a practice example','Review one scanner setup','Write one learning note']:
+            c.execute('INSERT INTO tasks(user_id,title,task_date,created_at) VALUES(?,?,?,?)',(uid,t,d,now()))
+        c.commit()
+    rows=[dict(r) for r in c.execute('SELECT * FROM tasks WHERE user_id=? AND task_date=? ORDER BY id',(uid,d)).fetchall()]; c.close(); return rows
+@app.post('/api/tasks/{tid}')
+def task(tid:int,x:TaskDone,authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); r=c.execute('SELECT * FROM tasks WHERE id=? AND user_id=?',(tid,uid)).fetchone();
+    if not r: c.close(); raise HTTPException(404,'Task not found')
+    was=r['done']; c.execute('UPDATE tasks SET done=? WHERE id=?',(int(x.done),tid));
+    if x.done and not was:
+        u=user(uid); xp=u['xp']+50; c.execute('UPDATE users SET xp=?,rank=?,updated_at=? WHERE id=?',(xp,rank_for(xp),now(),uid))
     c.commit(); c.close(); return {'ok':True}
 
+@app.get('/api/referrals')
+def referrals(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); u=user(uid); month=datetime.now(timezone.utc).strftime('%Y-%m'); rows=c.execute("SELECT referrer_id,COUNT(*) n FROM referrals WHERE status='qualified' AND substr(qualified_at,1,7)=? GROUP BY referrer_id ORDER BY n DESC,referrer_id LIMIT 10",(month,)).fetchall(); top=[]
+    for i,r in enumerate(rows,1):
+        uu=c.execute('SELECT username,full_name FROM users WHERE id=?',(r['referrer_id'],)).fetchone(); top.append({'position':i,'username':uu['username'] or uu['full_name'],'referrals':r['n']})
+    my=c.execute("SELECT COUNT(*) n FROM referrals WHERE referrer_id=? AND status='qualified' AND substr(qualified_at,1,7)=?",(uid,month)).fetchone()['n']; pos=1+c.execute("SELECT COUNT(*) n FROM (SELECT referrer_id,COUNT(*) n FROM referrals WHERE status='qualified' AND substr(qualified_at,1,7)=? GROUP BY referrer_id HAVING n>?)",(month,my)).fetchone()['n']; qualified=c.execute("SELECT COUNT(*) n FROM referrals WHERE referrer_id=? AND status='qualified'",(uid,)).fetchone()['n']; pending=c.execute("SELECT COUNT(*) n FROM referrals WHERE referrer_id=? AND status='pending'",(uid,)).fetchone()['n']; c.close(); return {'month':month,'top10':top,'my_position':pos,'my_referrals':my,'qualified':qualified,'pending':pending,'referral_code':u['referral_code']}
 
-@app.post('/api/admin/community/toggle')
-def toggle(req: Request):
-    u=current(req)
-    if not is_admin_email(u['email']) and u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    c=db(); new_state=not get_locked(c); set_locked(c,new_state)
-    users=c.execute('SELECT username FROM users').fetchall()
-    for r in users: push_notice(c,r['username'],'Community status','The community is now '+('locked.' if new_state else 'open.'),'community')
-    c.commit(); c.close(); return {'locked':new_state}
+@app.get('/api/community')
+def community(authorization:Optional[str]=Header(None)):
+    auth(authorization); c=db(); rows=c.execute('SELECT m.id,m.message,m.created_at,m.user_id,u.username,u.full_name,u.profile_picture FROM community_messages m JOIN users u ON u.id=m.user_id WHERE m.deleted=0 ORDER BY m.id ASC').fetchall(); c.close(); return [dict(r) for r in rows]
+@app.post('/api/community')
+def post_community(x:Message,authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); c.execute('INSERT INTO community_messages(user_id,message,created_at) VALUES(?,?,?)',(uid,x.message,now())); c.commit(); c.close(); return {'ok':True}
 
+@app.get('/api/journal')
+def journal_list(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); rows=[dict(r) for r in c.execute('SELECT * FROM journal WHERE user_id=? ORDER BY id DESC LIMIT 100',(uid,)).fetchall()]; c.close(); return rows
+
+class JournalIn(BaseModel): note:str=Field(min_length=1,max_length=5000)
+@app.post('/api/journal')
+def journal_add(x:JournalIn,authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); c.execute('INSERT INTO journal(user_id,note,created_at,updated_at) VALUES(?,?,?,?)',(uid,x.note,now(),now())); c.commit(); c.close(); return {'ok':True}
+
+@app.get('/api/achievements')
+def achievements(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); p=progress(authorization); keys=[]
+    if p['tasks_done']>=1: keys.append(('first_task','First Task'))
+    if p['tasks_done']>=10: keys.append(('ten_tasks','10 Tasks'))
+    if p['streak']>=7: keys.append(('streak7','7-Day Learning Streak'))
+    if p['qualified_referrals']>=1: keys.append(('first_referral','First Qualified Referral'))
+    c=db()
+    for k,_ in keys: c.execute('INSERT OR IGNORE INTO achievements(user_id,key,unlocked_at) VALUES(?,?,?)',(uid,k,now()))
+    c.commit(); rows=c.execute('SELECT key,unlocked_at FROM achievements WHERE user_id=? ORDER BY unlocked_at DESC',(uid,)).fetchall(); c.close(); return [dict(r) for r in rows]
+
+@app.get('/api/feedback')
+def feedback_list(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); q='SELECT f.*,u.username FROM feedback f JOIN users u ON u.id=f.user_id '
+    rows=c.execute(q+'ORDER BY f.id DESC'+(' LIMIT 100' if not admin(uid) else '')).fetchall(); c.close(); return [dict(r) for r in rows]
+@app.post('/api/feedback')
+def feedback(x:FeedbackIn,authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); c.execute('INSERT INTO feedback(user_id,rating,message,created_at,xp_awarded) VALUES(?,?,?,?,1)',(uid,x.rating,x.message,now())); u=user(uid); xp=u['xp']+25; c.execute('UPDATE users SET xp=?,rank=?,updated_at=? WHERE id=?',(xp,rank_for(xp),now(),uid)); c.commit(); c.close(); return {'ok':True,'xp_awarded':25}
+
+# -------- market analysis --------
+SYMBOL_MAP={'EURUSD':'EURUSD=X','GBPUSD':'GBPUSD=X','USDJPY':'JPY=X','GBPJPY':'GBPJPY=X','AUDUSD':'AUDUSD=X','USDCAD':'CAD=X','USDCHF':'CHF=X','NZDUSD':'NZDUSD=X','EURJPY':'EURJPY=X','EURGBP':'EURGBP=X','XAUUSD':'GC=F','XAGUSD':'SI=F','US30':'YM=F','NAS100':'NQ=F','SPX500':'ES=F','BTCUSD':'BTC-USD','ETHUSD':'ETH-USD','SOLUSD':'SOL-USD','XRPUSD':'XRP-USD','USOIL':'CL=F','UKOIL':'BZ=F','NATGAS':'NG=F'}
+INTERVALS={'1m':'1m','5m':'5m','15m':'15m','30m':'30m','1H':'60m','4H':'60m','1D':'1d'}
+RANGES={'1m':'1d','5m':'5d','15m':'10d','30m':'1mo','1H':'1mo','4H':'3mo','1D':'1y'}
+
+def fetch_chart(symbol,tf):
+    ticker=SYMBOL_MAP.get(symbol,symbol)
+    url='https://query1.finance.yahoo.com/v8/finance/chart/'+ticker
+    p={'interval':INTERVALS.get(tf,tf),'range':RANGES.get(tf,'10d'),'events':'history'}
+    r=requests.get(url,params=p,timeout=12,headers={'User-Agent':'Mozilla/5.0'}); r.raise_for_status(); j=r.json()['chart']['result'][0]; q=j['indicators']['quote'][0]
+    df=pd.DataFrame(q); df['timestamp']=pd.to_datetime(j['timestamp'],unit='s',utc=True); df=df.dropna(subset=['open','high','low','close']).reset_index(drop=True); return df,j.get('meta',{})
+
+def ema(s,n): return s.ewm(span=n,adjust=False).mean()
+def rsi(s,n=14):
+    d=s.diff(); up=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean(); dn=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean(); rs=up/(dn.replace(0,np.nan)); return 100-(100/(1+rs))
+def atr(df,n=14):
+    pc=df.close.shift(1); tr=pd.concat([(df.high-df.low),(df.high-pc).abs(),(df.low-pc).abs()],axis=1).max(axis=1); return tr.ewm(alpha=1/n,adjust=False).mean()
+
+def analyze(df):
+    e20,e50=ema(df.close,20),ema(df.close,50); rr=rsi(df.close); aa=atr(df); last=df.iloc[-1]; prev=df.iloc[-2]
+    score=50; reasons=[]; bull=0; bear=0
+    if last.close>e20.iloc[-1]>e50.iloc[-1]: bull+=1; score+=8; reasons.append('EMA trend alignment')
+    elif last.close<e20.iloc[-1]<e50.iloc[-1]: bear+=1; score+=8; reasons.append('EMA trend alignment')
+    if rr.iloc[-1]>55: bull+=1; score+=6; reasons.append('RSI momentum')
+    elif rr.iloc[-1]<45: bear+=1; score+=6; reasons.append('RSI momentum')
+    if last.close>prev.high: bull+=1; score+=8; reasons.append('Break above prior high')
+    elif last.close<prev.low: bear+=1; score+=8; reasons.append('Break below prior low')
+    if last.close>last.open: bull+=1
+    else: bear+=1
+    mid=df.close.rolling(20).mean().iloc[-1]; std=df.close.rolling(20).std().iloc[-1];
+    if last.close>mid+0.5*std: bull+=1; reasons.append('Volatility/momentum expansion')
+    elif last.close<mid-0.5*std: bear+=1; reasons.append('Volatility/momentum expansion')
+    direction='BUY' if bull>bear else 'SELL' if bear>bull else 'NO TRADE'
+    score=min(96,max(35,score+min(20,abs(bull-bear)*5))) if direction!='NO TRADE' else min(score,58)
+    a=float(aa.iloc[-1]); entry=float(last.close); recent_high=float(df.high.tail(10).max()); recent_low=float(df.low.tail(10).min())
+    if direction=='BUY': sl=min(recent_low,entry-a*0.8); tp1=entry+(entry-sl)*1.5; tp2=entry+(entry-sl)*2.3
+    elif direction=='SELL': sl=max(recent_high,entry+a*0.8); tp1=entry-(sl-entry)*1.5; tp2=entry-(sl-entry)*2.3
+    else: sl=tp1=tp2=entry
+    strength='High' if score>=80 else 'Strong' if score>=70 else 'Developing' if score>=60 else 'Weak'
+    return {'direction':direction,'confidence':int(score),'strength':strength,'entry':round(entry,6),'sl':round(sl,6),'tp1':round(tp1,6),'tp2':round(tp2,6),'atr':round(a,6),'reasons':reasons or ['Conflicting conditions']}
+
+def timeframe_trend(symbol,tf):
+    try:
+        df,_=fetch_chart(symbol,tf); x=analyze(df); return 'Bullish' if x['direction']=='BUY' else 'Bearish' if x['direction']=='SELL' else 'Neutral'
+    except Exception: return 'Unavailable'
+
+@app.get('/api/signals/scan')
+def scan(market:str='Forex',symbols:str='EURUSD',style:str='Scalping',timeframe:str='5m',authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); syms=[s.strip().upper() for s in symbols.split(',') if s.strip()]; out=[]
+    for sym in syms[:20]:
+        try:
+            df,meta=fetch_chart(sym,timeframe); a=analyze(df); trends={tf:timeframe_trend(sym,tf) for tf in ['15m','30m','1H','4H','1D']}
+            ts=df.timestamp.iloc[-1].isoformat(); candles=max(1,min(30,int(abs(df.close.iloc[-1]-df.close.tail(20).mean())/(a['atr'] or 1)*2)+1)); minutes={'1m':1,'5m':5,'15m':15,'30m':30,'1H':60}.get(timeframe,60); eta_min=candles*minutes
+            setup_id=f'{sym}-{timeframe}-{a["direction"]}-{df.timestamp.iloc[-1].strftime("%Y%m%d%H%M")}'
+            confs=a['reasons']+['Support/resistance structure','Supply/demand context','Data quality check']
+            out.append({'setup_id':setup_id,'market':market,'symbol':sym,'direction':a['direction'],'confidence':a['confidence'],'strength':a['strength'],'entry':a['entry'],'sl':a['sl'],'tp1':a['tp1'],'tp2':a['tp2'],'timeframe':timeframe,'style':style,'estimated_candles':candles,'estimated_minutes':eta_min,'next_signal':'Monitoring for confirmation' if a['direction']=='NO TRADE' else 'Setup developing','trends':trends,'reasons':a['reasons'],'confirmations':confs,'data_timestamp':ts,'data_source':'Yahoo Finance chart data','verified':True})
+            c=db(); c.execute('INSERT OR IGNORE INTO scanner_setups(id,user_id,symbol,market,direction,style,timeframe,confidence,strength,entry,sl,tp1,tp2,status,reason,confirmations,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(setup_id,uid,sym,market,a['direction'],style,timeframe,a['confidence'],a['strength'],a['entry'],a['sl'],a['tp1'],a['tp2'],'triggered' if a['direction']!='NO TRADE' and a['confidence']>=80 else 'developing',json.dumps(a['reasons']),json.dumps(confs),now()));
+            if a['direction'] in ('BUY','SELL') and a['confidence']>=80:
+                title=f'{sym} {a["direction"]} — ENTRY TRIGGERED'; message=f'{style} {timeframe} setup. Confidence {a["confidence"]}/100. Entry {a["entry"]} · SL {a["sl"]} · TP1 {a["tp1"]} · TP2 {a["tp2"]}'; c.execute('INSERT OR IGNORE INTO notifications(user_id,category,title,message,target,setup_id,created_at) VALUES(?,?,?,?,?,?,?)',(uid,'Signals',title,message,'signals',setup_id,now()))
+            c.commit(); c.close()
+        except Exception as e:
+            out.append({'symbol':sym,'direction':'NO TRADE','confidence':0,'strength':'Unavailable','verified':False,'next_signal':'Verified market data unavailable','error':str(e)})
+    return {'ok':True,'style':style,'timeframe':timeframe,'results':out}
+
+@app.get('/api/scanner/history')
+def scanner_history(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); rows=[dict(r) for r in c.execute('SELECT * FROM scanner_setups WHERE user_id=? ORDER BY created_at DESC LIMIT 100',(uid,)).fetchall()]; c.close(); return rows
+@app.get('/api/scanner/performance')
+def scanner_performance(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); total=c.execute('SELECT COUNT(*) n FROM scanner_setups WHERE user_id=?',(uid,)).fetchone()['n']; high=c.execute('SELECT COUNT(*) n FROM scanner_setups WHERE user_id=? AND confidence>=80',(uid,)).fetchone()['n']; buys=c.execute("SELECT COUNT(*) n FROM scanner_setups WHERE user_id=? AND direction='BUY'",(uid,)).fetchone()['n']; sells=c.execute("SELECT COUNT(*) n FROM scanner_setups WHERE user_id=? AND direction='SELL'",(uid,)).fetchone()['n']; c.close(); return {'total_setups':total,'high_confidence':high,'buy_setups':buys,'sell_setups':sells,'note':'Statistics reflect recorded scanner setups; they are not a guarantee of future results.'}
+
+@app.get('/api/notifications')
+def notifications(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); cutoff=(datetime.now(timezone.utc)-timedelta(days=14)).isoformat(); c=db(); c.execute('DELETE FROM notifications WHERE user_id=? AND created_at<?',(uid,cutoff)); c.commit(); rows=[dict(r) for r in c.execute('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 100',(uid,)).fetchall()]; c.close(); return rows
+@app.post('/api/notifications/clear')
+def clear_notifications(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); c.execute('UPDATE notifications SET cleared=1 WHERE user_id=?',(uid,)); c.commit(); c.close(); return {'ok':True}
+@app.post('/api/notifications/read/{nid}')
+def read_notification(nid:int,authorization:Optional[str]=Header(None)):
+    uid=auth(authorization); c=db(); c.execute('UPDATE notifications SET read=1 WHERE id=? AND user_id=?',(nid,uid)); c.commit(); c.close(); return {'ok':True}
 
 @app.get('/api/admin/status')
-def admin_status(req: Request):
-    u=current(req)
-    if not is_admin_email(u['email']) and u['role']!='admin':
-        raise HTTPException(403,'Admin access required.')
-    c=db(); locked=get_locked(c); c.close()
-    return {'is_admin':True,'username':u['username'],'email':u['email'],'community_locked':locked}
-
-
-@app.get('/api/admin/stats')
-def admin_stats(req: Request):
-    u=current(req)
-    if not is_admin_email(u['email']) and u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    c=db(); qualify_referrals(c)
-    total=c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
-    active=c.execute('SELECT COUNT(*) n FROM users WHERE last_active>=?',(int(time.time())-7*86400,)).fetchone()['n']
-    refs=c.execute("SELECT COUNT(*) n FROM referrals WHERE status='qualified'").fetchone()['n']
-    pending=c.execute("SELECT COUNT(*) n FROM referrals WHERE status='pending'").fetchone()['n']
-    locked=get_locked(c)
-    feedback_count=c.execute("SELECT COUNT(*) n FROM feedback WHERE status='new'").fetchone()['n']
-    c.commit(); c.close()
-    return {'total_users':total,'active_7d':active,'qualified_referrals':refs,'pending_referrals':pending,'feedback_new':feedback_count,'community_locked':locked,'monthly_referral_targets':REFERRAL_TARGETS,'rank_stages':['Beginner','Amateur','Professional','Expert','Master','Pips Master']}
+def admin_status(authorization:Optional[str]=Header(None)):
+    uid=auth(authorization)
+    if not admin(uid): raise HTTPException(403,'Admin only')
+    c=db(); users=c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']; feedback=c.execute('SELECT COUNT(*) n FROM feedback').fetchone()['n']; messages=c.execute('SELECT COUNT(*) n FROM community_messages WHERE deleted=0').fetchone()['n']; c.close(); return {'admin':True,'users':users,'feedback':feedback,'community':'open','messages':messages}

@@ -1,15 +1,11 @@
-# Pips Master Academy
+# Pips Master Academy — rebuild
 
-## Folder structure
-- `frontend/` — everything needed for the Netlify frontend.
-- `backend/` — FastAPI API, database setup and market-data helpers.
+This build contains a frontend and FastAPI backend. Set the backend environment variables in Render before deployment. Do not commit real passwords or secret keys.
 
-## Netlify
-Upload the contents of `frontend/` to Netlify, or connect the repository with the publish directory set to `frontend`.
+Backend start command:
+`uvicorn backend.app:app --host 0.0.0.0 --port $PORT`
 
-The frontend supports local persistence for profile data, referral links, notifications and community media when no backend is configured. For multi-device accounts and shared community data, configure `PMA_API_BASE` in the browser/local environment or update the API base in the frontend.
+Backend build command from repository root:
+`pip install -r backend/requirements.txt`
 
-## Backend
-Run the FastAPI application from the backend package. The backend now includes profile persistence, community message/media storage and notification endpoints.
-
-Never put backend secrets such as database passwords or market-data API keys in frontend code.
+Frontend can be deployed from the `frontend` directory to Vercel/Netlify/Cloudflare Pages.
