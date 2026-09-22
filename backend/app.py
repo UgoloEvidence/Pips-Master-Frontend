@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import bcrypt
 from pydantic import BaseModel, EmailStr
 
-from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso, norm_symbol, _tv_scan, _tv_setup, DEFAULT_FOREX_WATCHLIST, optimize_strict_scanner
+from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso, norm_symbol, _tv_scan, _tv_scan_many, _tv_setup, DEFAULT_FOREX_WATCHLIST, optimize_strict_scanner
 
 ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').lower()
 ADMIN_USERNAME = os.getenv('PMA_ADMIN_USERNAME', 'PipsMaster')
@@ -93,6 +93,19 @@ class Msg(BaseModel):
     media_data: str = ''
     media_type: str = ''
 
+class CommunityRequest(BaseModel):
+    action: str = 'request'
+
+class CommunityModeration(BaseModel):
+    user_id: int
+    action: str
+    note: str = ''
+
+class CommunitySettings(BaseModel):
+    name: str = 'PMA Community'
+    profile_picture: str = ''
+    disappearing_seconds: int = 0
+
 
 class Profile(BaseModel):
     full_name: str
@@ -134,6 +147,15 @@ def db():
     c.execute('''CREATE TABLE IF NOT EXISTS messages(
         id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '',
         media_type TEXT DEFAULT '', created INTEGER
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS community_members(
+        user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member',
+        warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0,
+        updated_at INTEGER DEFAULT 0, note TEXT DEFAULT ''
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS community_settings(
+        id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', profile_picture TEXT DEFAULT '',
+        disappearing_seconds INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS notifications(
         id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0,
@@ -183,6 +205,10 @@ def db():
     }.items():
         if name not in existing:
             c.execute(ddl)
+
+    now_seed=int(time.time())
+    c.execute("INSERT OR IGNORE INTO community_settings(id,name,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','',0,?)",(now_seed,))
+    c.execute("INSERT OR IGNORE INTO community_members(user_id,status,role,joined_at,updated_at) SELECT id,'approved',CASE WHEN role='admin' THEN 'admin' ELSE 'member' END,?,? FROM users",(now_seed,now_seed))
 
     # Keep notification history for 14 days only. Clearing the top-right inbox never deletes history.
     c.execute('DELETE FROM notifications WHERE created < ?', (int(time.time()) - 14*86400,))
@@ -389,6 +415,7 @@ def signup(x: Signup):
     c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
               (x.username.strip(),x.full_name.strip(),str(x.email).lower(),hash_password(x.password),pma,pma.replace('-',''),referrer['username'] if referrer else '',role,now,0,now,0,1))
     uid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
+    c.execute('INSERT OR REPLACE INTO community_members(user_id,status,role,joined_at,updated_at,note) VALUES(?,?,?,?,?,?)',(uid,'approved' if role=='admin' else 'pending','admin' if role=='admin' else 'member',now if role=='admin' else 0,now,'Approved automatically for administrator' if role=='admin' else 'Awaiting administrator approval'))
     c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(uid,datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'signup',now))
     if referrer and referrer['id'] != uid:
         c.execute('INSERT OR IGNORE INTO referrals(referrer_id,referred_id,challenge_month,status,created,qualification_due) VALUES(?,?,?,?,?,?)',
@@ -499,7 +526,7 @@ def my_feedback(req: Request):
     return {'feedback':[{'category':r['category'],'rating':r['rating'],'message':r['message'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'status':r['status']} for r in rows]}
 
 
-def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
+def prepare_market_setup(symbol, market, trigger_timeframe='15m', tv_snaps=None):
     trigger_timeframe = trigger_timeframe if trigger_timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m'
     # Primary live source: one TradingView scanner request carries all MTF snapshots.
     # This removes the old six-request Yahoo bottleneck that caused long loading states.
@@ -507,7 +534,7 @@ def prepare_market_setup(symbol, market, trigger_timeframe='15m'):
         tfs = ['15m','30m','1h','4h','1d']
         if trigger_timeframe not in tfs:
             tfs.append(trigger_timeframe)
-        snaps = _tv_scan(symbol, market, tfs)
+        snaps = tv_snaps if tv_snaps is not None else _tv_scan(symbol, market, tfs)
         setup = _tv_setup(symbol, market, trigger_timeframe, snaps)
         psize = pip_size(symbol)
         trends = {tf:_snapshot_trend_safe(snaps[tf]) for tf in snaps}
@@ -598,37 +625,44 @@ def scan(market: str='Forex', symbols: str='', timeframe: str='15m'):
     if symbols.strip():
         requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:20]
     elif market == 'Forex':
-        requested=DEFAULT_FOREX_WATCHLIST[:]  # Always scan at least six major/active FX pairs by default.
+        requested=DEFAULT_FOREX_WATCHLIST[:]
     else:
-        requested=[x.strip().upper() for x in symbols.split(',') if x.strip()] if symbols.strip() else []
+        requested=[x.strip().upper() for x in symbols.split(',') if x.strip()]
+    requested=requested or (DEFAULT_FOREX_WATCHLIST[:] if market=='Forex' else [])
+    requested=requested[:8]
     opportunities=[]; errors=[]
-    def build(sym):
-        return prepare_market_setup(sym,market,timeframe)
-    with ThreadPoolExecutor(max_workers=min(6,max(1,len(requested)))) as pool:
-        jobs={pool.submit(build,sym):sym for sym in requested}
-        for job in as_completed(jobs):
-            sym=jobs[job]
-            try: opportunities.append(job.result())
-            except Exception as ex: errors.append({'symbol':sym,'error':str(ex)})
-
-    # Closest = nearest planned entry zone by price distance, with real READY setups
-    # taking precedence only when their entry is actually confirmed.
+    tfs=['15m','30m','1h','4h','1d']
+    if timeframe not in tfs: tfs.append(timeframe)
+    # Fast path: one provider request for the whole watchlist, then calculate each
+    # setup locally. If batch data is unavailable, fall back to the existing per-pair
+    # verified path rather than inventing data.
+    batch={}
+    try:
+        batch=_tv_scan_many(requested,market,tfs)
+    except Exception as batch_error:
+        errors.append({'scope':'batch','error':str(batch_error)})
+    for sym in requested:
+        try:
+            if sym in batch:
+                opportunities.append(prepare_market_setup(sym,market,timeframe,batch[sym]))
+            else:
+                opportunities.append(prepare_market_setup(sym,market,timeframe))
+        except Exception as ex:
+            errors.append({'symbol':sym,'error':str(ex)})
     def rank_key(x):
+        # READY setups first; otherwise the closest valid planned pullback zone.
         ready=0 if x.get('status') in ('SIGNAL READY','ACTIVE') else 1
         dist=x.get('distance_to_entry_zone')
         if dist is None: dist=x.get('distance_to_next_zone')
         return (ready, dist if dist is not None else 10**18, -(x.get('setup_strength') or 0))
     opportunities.sort(key=rank_key)
     closest=opportunities[0] if opportunities else None
-    return {
-        'closest':closest,
-        'closest_pair':closest.get('symbol') if closest else None,
-        'timeframe': timeframe if timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m',
-        'opportunities':opportunities,'errors':errors,'market':market,'symbols':requested,
-        'pairs_scanned':len(requested),'minimum_pairs':6 if market=='Forex' else min(6,len(requested)),
-        'message':f'Verified candle data loaded for {len(opportunities)} pair(s).' if opportunities else 'No verified candle data was returned; no signal is being invented.',
-        'updated_at':utc_iso()
-    }
+    return {'closest':closest,'closest_pair':closest.get('symbol') if closest else None,
+            'timeframe':timeframe if timeframe in {'1m','5m','15m','1h','4h','1d'} else '15m',
+            'opportunities':opportunities,'errors':errors,'market':market,'symbols':requested,
+            'pairs_scanned':len(opportunities),'minimum_pairs':6 if market=='Forex' else min(6,len(requested)),
+            'message':f'Live market snapshots loaded for {len(opportunities)} pair(s).' if opportunities else 'No verified candle data was returned; no signal is being invented.',
+            'updated_at':utc_iso(),'batch_fast_path':bool(batch)}
 
 
 @app.get('/api/scanner/backtest')
@@ -654,24 +688,23 @@ def candles(symbol: str='EURUSD', timeframe: str='15m'):
 
 @app.get('/api/day-trade/plan')
 def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJPY,XAUUSD,BTCUSD', timeframe: str='15m'):
-    requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:15]
+    requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:8]
     results=[]; errors=[]
-    # Fetch the small day-trade watchlist concurrently. The old sequential loop could
-    # wait several seconds per symbol when a provider was slow.
-    def build(sym):
-        setup=prepare_market_setup(sym,market,timeframe)
-        context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
-        setup['day_trade_state']='READY' if context_ok and setup['status']=='SIGNAL READY' else ('FORECAST' if setup['direction']!='NO TRADE' else 'WAITING')
-        setup['day_trade_reason']=f"{timeframe} forecast is aligned with 1H and 4H context." if context_ok else 'Forecast is developing; wait for cleaner 1H/4H confirmation.'
-        return setup
-    with ThreadPoolExecutor(max_workers=min(4,max(1,len(requested)))) as pool:
-        jobs={pool.submit(build,sym):sym for sym in requested}
-        for job in as_completed(jobs):
-            sym=jobs[job]
-            try: results.append(job.result())
-            except Exception as ex: errors.append({'symbol':sym,'error':str(ex)})
-    results.sort(key=lambda x:(0 if x['day_trade_state']=='READY' else 1,-(x['setup_strength'] or 0)))
-    return {'date':datetime.now(timezone.utc).strftime('%Y-%m-%d'),'market':market,'setups':results,'errors':errors,'updated_at':utc_iso(),'note':'Day-trade projections are estimates based on verified candle data; future price movement is not guaranteed.'}
+    tfs=['15m','30m','1h','4h','1d']
+    if timeframe not in tfs: tfs.append(timeframe)
+    batch={}
+    try: batch=_tv_scan_many(requested,market,tfs)
+    except Exception as ex: errors.append({'scope':'batch','error':str(ex)})
+    for sym in requested:
+        try:
+            setup=prepare_market_setup(sym,market,timeframe,batch.get(sym))
+            context_ok=setup['trends'].get('1h')==setup['trends'].get('4h') and setup['direction']!='NO TRADE'
+            setup['day_trade_state']='READY' if context_ok and setup['status']=='SIGNAL READY' else ('FORECAST' if setup['direction']!='NO TRADE' else setup['status'])
+            setup['day_trade_reason']=f"{timeframe} forecast is aligned with 1H and 4H context." if context_ok else 'Trend is context only. Wait for the planned pullback and rejection before entering.'
+            results.append(setup)
+        except Exception as ex: errors.append({'symbol':sym,'error':str(ex)})
+    results.sort(key=lambda x:(0 if x['day_trade_state']=='READY' else 1,x.get('distance_to_entry_zone') if x.get('distance_to_entry_zone') is not None else 10**18))
+    return {'date':datetime.now(timezone.utc).strftime('%Y-%m-%d'),'market':market,'setups':results,'errors':errors,'updated_at':utc_iso(),'batch_fast_path':bool(batch),'note':'Trend is context only. Entries require a pullback into demand/supply and rejection confirmation.'}
 
 
 @app.get('/api/referrals')
@@ -785,15 +818,49 @@ def complete_task(req: Request, x: Completion):
     c.commit(); c.close(); return {'ok':True,'new_completion':not bool(exists),'item':task}
 
 
-@app.get('/api/community/messages')
-def get_messages(req: Request):
-    current(req); c=db(); rows=c.execute('SELECT * FROM messages ORDER BY id ASC LIMIT 300').fetchall(); is_locked=get_locked(c); c.close()
-    return {'locked':is_locked,'messages':[{'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M')} for r in rows]}
+def community_settings_row(c):
+    r=c.execute('SELECT * FROM community_settings WHERE id=1').fetchone()
+    return {'name':r['name'] if r else 'PMA Community','profile_picture':r['profile_picture'] if r else '', 'disappearing_seconds':int(r['disappearing_seconds'] or 0) if r else 0}
 
+def community_member(c,user_id):
+    return c.execute('SELECT * FROM community_members WHERE user_id=?',(user_id,)).fetchone()
+
+def require_community_member(req):
+    u=current(req); c=db(); m=community_member(c,u['id'])
+    if not m or m['status']!='approved':
+        c.close(); raise HTTPException(403,'Community access is awaiting administrator approval.')
+    if m['suspended_until'] and int(m['suspended_until'])>int(time.time()):
+        until=datetime.fromtimestamp(m['suspended_until'],timezone.utc).isoformat(); c.close(); raise HTTPException(403,f'Community access is suspended until {until}.')
+    return u,c,m
+
+@app.get('/api/community/status')
+def community_status(req: Request):
+    u=current(req); c=db(); m=community_member(c,u['id']); settings=community_settings_row(c)
+    pending=bool(m and m['status']=='pending'); approved=bool(m and m['status']=='approved'); suspended=bool(m and m['status']=='suspended' and (m['suspended_until'] or 0)>int(time.time()))
+    c.close(); return {'approved':approved,'pending':pending,'suspended':suspended,'status':m['status'] if m else 'pending','role':m['role'] if m else 'member','settings':settings}
+
+@app.post('/api/community/join')
+def community_join(req: Request, x: CommunityRequest):
+    u=current(req); c=db(); m=community_member(c,u['id']); now=int(time.time())
+    if m and m['status']=='approved': c.close(); return {'ok':True,'status':'approved'}
+    c.execute('INSERT OR REPLACE INTO community_members(user_id,status,role,warning_count,suspended_until,joined_at,updated_at,note) VALUES(?,?,?,?,?,?,?,?)',(u['id'],'pending','admin' if u['role']=='admin' else 'member',m['warning_count'] if m else 0,0,m['joined_at'] if m else 0,now,'Join request submitted'))
+    admins=c.execute("SELECT username FROM users WHERE role='admin'").fetchall()
+    for a in admins: push_notice(c,a['username'],'Community join request',f"{u['username']} requested access to the community.",'community')
+    c.commit(); c.close(); return {'ok':True,'status':'pending'}
+
+@app.get('/api/community/messages')
+def get_messages(req: Request, q: str=''):
+    u,c,m=require_community_member(req); locked=get_locked(c); settings=community_settings_row(c)
+    if q.strip(): rows=c.execute('SELECT * FROM messages WHERE text LIKE ? ORDER BY id ASC LIMIT 300',(f'%{q.strip()}%',)).fetchall()
+    else: rows=c.execute('SELECT * FROM messages ORDER BY id ASC LIMIT 300').fetchall()
+    cutoff=int(time.time())-int(settings['disappearing_seconds'] or 0) if settings['disappearing_seconds'] else 0
+    if cutoff: c.execute('DELETE FROM messages WHERE created<?',(cutoff,)); c.commit()
+    c.close()
+    return {'locked':locked,'settings':settings,'messages':[{'id':r['id'],'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M'),'created':r['created']} for r in rows if not cutoff or r['created']>=cutoff]}
 
 @app.post('/api/community/messages')
 def post_message(req: Request, x: Msg):
-    u=current(req); c=db(); is_locked=get_locked(c)
+    u,c,m=require_community_member(req); is_locked=get_locked(c)
     if is_locked and u['role']!='admin': c.close(); raise HTTPException(403,'Community chat is locked by the administrator.')
     if not x.text.strip() and not x.media_data: c.close(); raise HTTPException(400,'Message cannot be empty.')
     now=int(time.time())
@@ -802,6 +869,40 @@ def post_message(req: Request, x: Msg):
     users=c.execute('SELECT username FROM users WHERE username<>?',(u['username'],)).fetchall()
     for r in users: push_notice(c,r['username'],'New community message',f"{u['username']} posted in the community.",'community')
     c.commit(); c.close(); return {'ok':True}
+
+@app.get('/api/admin/community/members')
+def community_members(req: Request, status: str=''):
+    u=current(req)
+    if u['role']!='admin': raise HTTPException(403,'Admin access required.')
+    c=db(); sql="SELECT u.id,u.username,u.full_name,u.email,u.pma_id,u.profile_picture,u.last_active,u.role AS account_role, cm.status,cm.role AS community_role,cm.warning_count,cm.suspended_until,cm.joined_at,cm.note FROM users u JOIN community_members cm ON cm.user_id=u.id"; params=[]
+    if status: sql+=' WHERE cm.status=?'; params.append(status)
+    sql+=" ORDER BY CASE cm.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, u.username COLLATE NOCASE"
+    rows=c.execute(sql,params).fetchall(); c.close(); return {'members':[dict(r) for r in rows]}
+
+@app.post('/api/admin/community/moderate')
+def moderate_community(req: Request, x: CommunityModeration):
+    u=current(req)
+    if u['role']!='admin': raise HTTPException(403,'Admin access required.')
+    c=db(); target=c.execute('SELECT * FROM users WHERE id=?',(x.user_id,)).fetchone()
+    if not target: c.close(); raise HTTPException(404,'Member not found.')
+    if target['role']=='admin' and x.action in ('remove','suspend'): c.close(); raise HTTPException(400,'Administrator accounts cannot be removed or suspended here.')
+    m=community_member(c,x.user_id); now=int(time.time())
+    if not m: c.close(); raise HTTPException(404,'Community membership not found.')
+    if x.action=='approve': status='approved'; joined=now; note=x.note or 'Approved by administrator'; until=0
+    elif x.action=='remove': status='removed'; joined=m['joined_at'] or 0; note=x.note or 'Removed by administrator'; until=0
+    elif x.action=='warn': status=m['status']; joined=m['joined_at'] or 0; note=x.note or 'Community warning'; until=m['suspended_until'] or 0; c.execute('UPDATE community_members SET warning_count=warning_count+1,updated_at=?,note=? WHERE user_id=?',(now,note,x.user_id))
+    elif x.action=='suspend': status='suspended'; joined=m['joined_at'] or 0; note=x.note or 'Suspended by administrator'; until=now+86400
+    elif x.action=='restore': status='approved'; joined=m['joined_at'] or now; note=x.note or 'Restored by administrator'; until=0
+    else: c.close(); raise HTTPException(400,'Unsupported moderation action.')
+    if x.action!='warn': c.execute('UPDATE community_members SET status=?,joined_at=?,updated_at=?,note=?,suspended_until=? WHERE user_id=?',(status,joined,now,note,until,x.user_id))
+    push_notice(c,target['username'],'Community moderation',note,'community'); c.commit(); c.close(); return {'ok':True,'status':status}
+
+@app.post('/api/admin/community/settings')
+def update_community_settings(req: Request, x: CommunitySettings):
+    u=current(req)
+    if u['role']!='admin': raise HTTPException(403,'Admin access required.')
+    seconds=max(0,min(int(x.disappearing_seconds or 0),7*86400)); name=x.name.strip()[:80] or 'PMA Community'; now=int(time.time())
+    c=db(); c.execute('UPDATE community_settings SET name=?,profile_picture=?,disappearing_seconds=?,updated_at=? WHERE id=1',(name,x.profile_picture,seconds,now)); c.commit(); out=community_settings_row(c); c.close(); return {'ok':True,'settings':out}
 
 
 @app.post('/api/admin/community/toggle')

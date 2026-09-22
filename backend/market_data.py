@@ -177,6 +177,68 @@ def _tv_tickers(symbol, market='Forex'):
     return [p + s for p in TV_TICKER_PREFIXES.get(market, ['OANDA:', 'FX_IDC:'])]
 
 
+def _tv_scan_many(symbols, market='Forex', timeframes=None):
+    """Fetch one fresh TradingView snapshot for several symbols in a single request.
+
+    This is the fast path for the scanner/day-trade watchlist. It keeps the same
+    provider and fields as _tv_scan but removes the N-per-symbol HTTP round trips.
+    """
+    timeframes = tuple(timeframes or ('15m','30m','1h','4h','1d'))
+    symbols = [norm_symbol(x) for x in symbols if norm_symbol(x)]
+    if not symbols:
+        return {}
+    cache_key = ('many', tuple(sorted(symbols)), market, timeframes)
+    now = time.time()
+    cached = TV_CACHE.get(cache_key)
+    if cached and now - cached[0] < TV_CACHE_TTL:
+        return cached[1]
+    columns=[]
+    bases=['open','high','low','close','RSI','EMA20','EMA50','EMA100','ATR','Recommend.All',
+           'Pivot.M.Classic.S1','Pivot.M.Classic.R1','change']
+    for tf in timeframes:
+        for base in bases:
+            columns.append(_tv_field(base,tf))
+    endpoint=('https://scanner.tradingview.com/forex/scan' if market in ('Forex','Metals') else
+              ('https://scanner.tradingview.com/crypto/scan' if market=='Crypto' else
+               'https://scanner.tradingview.com/global/scan'))
+    tickers=[]
+    for sym in symbols:
+        prefixes=TV_TICKER_PREFIXES.get(market,['OANDA:','FX_IDC:'])
+        for pref in prefixes:
+            tickers.append(pref+sym)
+    payload={'symbols':{'tickers':tickers,'query':{'types':[]}},'columns':columns,'range':[0,len(tickers)],'options':{'lang':'en'}}
+    req=urllib.request.Request(endpoint,data=json.dumps(payload).encode('utf-8'),headers={
+        'Content-Type':'application/json','Accept':'application/json','User-Agent':'Mozilla/5.0 PMA/5.0',
+        'Origin':'https://www.tradingview.com','Referer':'https://www.tradingview.com/'})
+    with urllib.request.urlopen(req,timeout=1.8) as response:
+        raw=json.loads(response.read().decode('utf-8',errors='replace'))
+    rows=raw.get('data') or []
+    out={}
+    wanted=set(symbols)
+    for row in rows:
+        ticker=str(row.get('s') or '')
+        sym=None
+        for candidate in symbols:
+            if ticker.upper().endswith(':'+candidate) or ticker.upper()==candidate:
+                sym=candidate; break
+        if not sym or sym in out: continue
+        vals=row.get('d') or []
+        if len(vals)!=len(columns): continue
+        flat=dict(zip(columns,vals)); snap={}
+        for tf in timeframes:
+            def num(base):
+                v=flat.get(_tv_field(base,tf))
+                try:return float(v) if v is not None else None
+                except (TypeError,ValueError):return None
+            snap[tf]={'ticker':ticker,'open':num('open'),'high':num('high'),'low':num('low'),'close':num('close'),
+                      'rsi':num('RSI'),'ema20':num('EMA20'),'ema50':num('EMA50'),'ema100':num('EMA100'),'atr':num('ATR'),
+                      'recommend':num('Recommend.All'),'s1':num('Pivot.M.Classic.S1'),'r1':num('Pivot.M.Classic.R1'),'change':num('change')}
+        if any(snap[tf].get('close') is not None for tf in timeframes): out[sym]=snap
+    if not out:
+        raise ValueError(f'No verified TradingView rows returned for {market}')
+    TV_CACHE[cache_key]=(time.time(),out)
+    return out
+
 def _tv_scan(symbol, market='Forex', timeframes=None):
     """Fetch a verified multi-timeframe snapshot quickly.
 
@@ -292,142 +354,113 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
     buy_context = trend == 'Bullish' and buy_rsi_ok and bull >= 3 and rec >= 0.25
     sell_context = trend == 'Bearish' and sell_rsi_ok and bear >= 3 and rec <= -0.25
 
-    # First protect the user from chasing a move directly into the opposing zone.
-    # Near supply in a bullish market -> forecast the pullback, not a late BUY.
-    if near_supply and trend == 'Bullish' and bear <= 2 and rsi_v >= 60 and rec <= 0.15:
-        direction = 'SELL'
-        status = 'FORECAST'
-        trigger_price = r1
-        entry = r1
-        stop = r1 + atr_v * 0.20
-        risk = max(stop - entry, atr_v * 0.20)
-        tp1 = close
-        tp2 = close - risk
-        next_zone = s1 if s1 is not None else close - atr_v
-        zone_type = 'Supply rejection / pullback'
-        reasons = ['Price is approaching a supply/resistance zone',
-                   'Forecast is for a pullback rather than chasing BUY into supply',
-                   f'{bull}/5 context timeframes remain bullish',
-                   f'Trigger RSI: {rsi_v:.1f}']
-        if close >= r1:
-            status = 'SIGNAL READY' if rec <= -0.25 else 'FORECAST'
-            if status == 'SIGNAL READY': reasons.append('Price has reached supply and momentum confirms rejection')
-        trigger_text = f'Forecast pullback from supply near {r1:.8f}; wait for rejection before SELL'
-    elif near_demand and trend == 'Bearish' and bull <= 2 and rsi_v <= 40 and rec >= -0.15:
-        direction = 'BUY'
-        status = 'FORECAST'
-        trigger_price = s1
-        entry = s1
-        stop = s1 - atr_v * 0.20
-        risk = max(entry - stop, atr_v * 0.20)
-        tp1 = close
-        tp2 = close + risk
-        next_zone = r1 if r1 is not None else close + atr_v
-        zone_type = 'Demand rejection / bounce'
-        reasons = ['Price is approaching a demand/support zone',
-                   'Forecast is for a bounce rather than chasing SELL into demand',
-                   f'{bear}/5 context timeframes remain bearish',
-                   f'Trigger RSI: {rsi_v:.1f}']
-        if close <= s1:
-            status = 'SIGNAL READY' if rec >= 0.25 else 'FORECAST'
-            if status == 'SIGNAL READY': reasons.append('Price has reached demand and momentum confirms bounce')
-        trigger_text = f'Forecast bounce from demand near {s1:.8f}; wait for rejection before BUY'
+    # Pullback-only entry rule: trend identifies the direction, but never authorizes
+    # an immediate market entry. BUY requires a retrace into demand plus rejection;
+    # SELL requires a retrace into supply plus rejection.
+    zone_tol = atr_v * 0.18
+    supply_reached = r1 is not None and close >= r1 - zone_tol
+    demand_reached = s1 is not None and close <= s1 + zone_tol
+    supply_broken = r1 is not None and close > r1 + atr_v * 0.25
+    demand_broken = s1 is not None and close < s1 - atr_v * 0.25
+    last_open = trigger.get('open') or close
+    last_high = trigger.get('high') or close
+    last_low = trigger.get('low') or close
+    bullish_rejection = (s1 is not None and demand_reached and close > s1 and last_low <= s1 + zone_tol and close >= last_open and rec >= 0.25)
+    bearish_rejection = (r1 is not None and supply_reached and close < r1 and last_high >= r1 - zone_tol and close <= last_open and rec <= -0.25)
+
+    # Opposing-zone protection: once an uptrend reaches supply, do not issue BUY;
+    # once a downtrend reaches demand, do not issue SELL. Wait for a fresh setup.
+    if trend == 'Bullish' and supply_reached and not bullish_rejection:
+        direction='NO TRADE'; status='ZONE REJECTION / NO BUY'; next_zone=s1 if s1 is not None else close-atr_v; entry=None; zone_type='Supply reached — BUY blocked'
+        reasons=['Bullish trend remains context only','Price has reached/approached supply; BUY is blocked here','Wait for a fresh demand pullback instead of entering into rejection']
+        trigger_text='NO BUY at supply; wait for the next demand pullback and rejection'
+    elif trend == 'Bearish' and demand_reached and not bearish_rejection:
+        direction='NO TRADE'; status='ZONE REJECTION / NO SELL'; next_zone=r1 if r1 is not None else close+atr_v; entry=None; zone_type='Demand reached — SELL blocked'
+        reasons=['Bearish trend remains context only','Price has reached/approached demand; SELL is blocked here','Wait for a fresh supply pullback instead of entering into rejection']
+        trigger_text='NO SELL at demand; wait for the next supply pullback and rejection'
     elif buy_context:
-        direction = 'BUY'
-        status = 'FORECAST'
-        trigger_price = s1 if s1 is not None else close - atr_v
-        entry = trigger_price
-        stop = trigger_price - atr_v * 0.20
-        risk = max(entry - stop, atr_v * 0.20)
-        tp1 = r1 if r1 is not None else close + risk
-        tp2 = tp1 + risk
-        next_zone = r1 if r1 is not None else close + atr_v
-        zone_type = 'Demand pullback / bullish continuation'
-        reasons = ['Bullish forecast from trigger-timeframe structure',
-                   f'{bull}/5 context timeframes are bullish',
-                   f'RSI supports BUY bias at {rsi_v:.1f}',
-                   'Planned entry is the pullback zone; do not chase current price']
-        if r1 is not None and close >= r1 and rec >= 0.25:
-            status = 'SIGNAL READY'
-            entry = close
-            stop = close - atr_v * 0.20
-            risk = max(close-stop, atr_v*0.20)
-            tp1, tp2 = close+risk, close+risk*2
-            reasons.append('Price confirmed continuation above resistance')
-        trigger_text = f'Forecast BUY on pullback toward demand near {trigger_price:.8f}'
+        direction='BUY'; status='FORECAST'
+        trigger_price=s1 if s1 is not None else close-atr_v
+        entry=trigger_price
+        stop=(s1-atr_v*0.20) if s1 is not None else trigger_price-atr_v*0.20
+        risk=max(entry-stop,atr_v*0.20)
+        tp1=r1 if r1 is not None and r1>entry else close+risk
+        tp2=tp1+risk
+        next_zone=trigger_price; zone_type='Demand pullback / bullish continuation'
+        reasons=['Bullish MTF trend identified; this is a forecast, not an immediate BUY',f'{bull}/5 context timeframes are bullish',f'RSI supports the bullish bias at {rsi_v:.1f}','Wait for price to retrace into demand and reject it before BUY']
+        if supply_broken:
+            direction='NO TRADE'; status='FORECAST INVALIDATED'; entry=None; stop=None; tp1=None; tp2=None
+            reasons=['Bullish forecast invalidated: price has already broken the projected supply/resistance zone','No BUY is issued after an extended move; wait for a fresh pullback structure']
+        elif bullish_rejection:
+            status='SIGNAL READY'; entry=close; stop=(s1-atr_v*0.20) if s1 is not None else close-atr_v*0.20
+            risk=max(entry-stop,atr_v*0.20); tp1=r1 if r1 is not None and r1>entry else entry+risk; tp2=tp1+risk
+            reasons.append('Demand was reached and the trigger candle rejected the zone; BUY confirmation is present')
+        trigger_text=f'WAIT for pullback into demand near {trigger_price:.8f}; require bullish rejection before BUY'
     elif sell_context:
-        direction = 'SELL'
-        status = 'FORECAST'
-        trigger_price = r1 if r1 is not None else close + atr_v
-        entry = trigger_price
-        stop = trigger_price + atr_v * 0.20
-        risk = max(stop-entry, atr_v*0.20)
-        tp1 = s1 if s1 is not None else close-risk
-        tp2 = tp1-risk
-        next_zone = s1 if s1 is not None else close-atr_v
-        zone_type = 'Supply pullback / bearish continuation'
-        reasons = ['Bearish forecast from trigger-timeframe structure',
-                   f'{bear}/5 context timeframes are bearish',
-                   f'RSI supports SELL bias at {rsi_v:.1f}',
-                   'Planned entry is the pullback zone; do not chase current price']
-        if s1 is not None and close <= s1 and rec <= -0.25:
-            status = 'SIGNAL READY'
-            entry = close
-            stop = close + atr_v*0.20
-            risk=max(stop-close,atr_v*0.20)
-            tp1, tp2 = close-risk, close-risk*2
-            reasons.append('Price confirmed continuation below support')
-        trigger_text = f'Forecast SELL on pullback toward supply near {trigger_price:.8f}'
+        direction='SELL'; status='FORECAST'
+        trigger_price=r1 if r1 is not None else close+atr_v
+        entry=trigger_price
+        stop=(r1+atr_v*0.20) if r1 is not None else trigger_price+atr_v*0.20
+        risk=max(stop-entry,atr_v*0.20)
+        tp1=s1 if s1 is not None and s1<entry else close-risk
+        tp2=tp1-risk
+        next_zone=trigger_price; zone_type='Supply pullback / bearish continuation'
+        reasons=['Bearish MTF trend identified; this is a forecast, not an immediate SELL',f'{bear}/5 context timeframes are bearish',f'RSI supports the bearish bias at {rsi_v:.1f}','Wait for price to retrace into supply and reject it before SELL']
+        if demand_broken:
+            direction='NO TRADE'; status='FORECAST INVALIDATED'; entry=None; stop=None; tp1=None; tp2=None
+            reasons=['Bearish forecast invalidated: price has already broken the projected demand/support zone','No SELL is issued after an extended move; wait for a fresh pullback structure']
+        elif bearish_rejection:
+            status='SIGNAL READY'; entry=close; stop=(r1+atr_v*0.20) if r1 is not None else close+atr_v*0.20
+            risk=max(stop-entry,atr_v*0.20); tp1=s1 if s1 is not None and s1<entry else entry-risk; tp2=tp1-risk
+            reasons.append('Supply was reached and the trigger candle rejected the zone; SELL confirmation is present')
+        trigger_text=f'WAIT for pullback into supply near {trigger_price:.8f}; require bearish rejection before SELL'
+    elif trend == 'Bullish' and bull >= 3:
+        direction='NO TRADE'; status='WAITING FOR PULLBACK'; next_zone=s1 if s1 is not None else close-atr_v; entry=next_zone; zone_type='Demand pullback required'
+        reasons=['Bullish trend identified across multiple timeframes','No BUY at current price: wait for a demand pullback and rejection']
+        trigger_text=f'WAIT for demand pullback near {next_zone:.8f}; no market BUY'
+    elif trend == 'Bearish' and bear >= 3:
+        direction='NO TRADE'; status='WAITING FOR PULLBACK'; next_zone=r1 if r1 is not None else close+atr_v; entry=next_zone; zone_type='Supply pullback required'
+        reasons=['Bearish trend identified across multiple timeframes','No SELL at current price: wait for a supply pullback and rejection']
+        trigger_text=f'WAIT for supply pullback near {next_zone:.8f}; no market SELL'
     else:
-        reasons = ['Confluence is insufficient for a forecast', f'Trigger timeframe trend: {trend}', f'TradingView technical rating: {rec:.2f}']
+        reasons=['Confluence is insufficient for a pullback forecast',f'Trigger timeframe trend: {trend}',f'TradingView technical rating: {rec:.2f}']
+        trigger_text=f'Wait for clearer {trigger_tf} structure and a pullback zone'
 
     if direction == 'NO TRADE':
-        return {'direction':'NO TRADE','score':0,'status':status,'reasons':reasons,'structure':'Mixed / no confirmed structure',
-                'trigger_text':f'Wait for {trigger_tf} confirmation','trigger_price':None,'entry_zone':None,'stop_loss':None,
-                'take_profit_1':None,'take_profit_2':None,'next_zone':None,'next_zone_type':None,'candles_to_next_zone':None,
-                'estimated_minutes_to_next_zone':None,'distance_to_next_zone':None,'atr':atr_v,'last':close,'support':s1,'resistance':r1,
+        distance=abs((next_zone or close)-close)
+        tf_minutes=TIMEFRAME_MINUTES.get(trigger_tf,15)
+        candles=max(1,min(96,math.ceil(distance/max(atr_v,1e-12)))) if distance else 0
+        return {'direction':'NO TRADE','score':0,'status':status,'reasons':reasons,'structure':'Bullish trend / pullback pending' if trend=='Bullish' else ('Bearish trend / pullback pending' if trend=='Bearish' else 'Mixed / no confirmed structure'),
+                'trigger_text':trigger_text,'trigger_price':trigger_price,'entry_zone':entry,'stop_loss':stop,
+                'take_profit_1':tp1,'take_profit_2':tp2,'next_zone':next_zone,'next_zone_type':zone_type,'candles_to_next_zone':candles,
+                'estimated_minutes_to_next_zone':candles*tf_minutes,'distance_to_next_zone':distance,'atr':atr_v,'last':close,'support':s1,'resistance':r1,
                 'rsi':rsi_v,'trend':trend,'trend_scores':list(context.values()),'context_trends':context,
                 'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'Live TradingView snapshot; historical backtest unavailable'}}
-
-    # Do not label a marginal forecast as high quality. The forecast has to
-    # survive the same confluence gate used for the live directional bias.
-    zone_forecast = zone_type in ('Supply rejection / pullback','Demand rejection / bounce') and status == 'FORECAST'
-    if direction == 'BUY' and not buy_context and status != 'SIGNAL READY' and not zone_forecast:
-        return {'direction':'NO TRADE','score':0,'status':'WAITING FOR CONFIRMATION',
-                'reasons':['BUY bias rejected by the high-precision filter',
-                          f'MTF bullish alignment: {bull}/5',
-                          f'RSI: {rsi_v:.1f} (preferred BUY range 52-68)',
-                          f'TradingView rating: {rec:.2f}'],
-                'structure':'Insufficient confluence','trigger_text':f'Wait for stronger {trigger_tf} confirmation',
-                'trigger_price':None,'entry_zone':None,'stop_loss':None,'take_profit_1':None,'take_profit_2':None,
-                'next_zone':None,'next_zone_type':None,'candles_to_next_zone':None,'estimated_minutes_to_next_zone':None,
-                'distance_to_next_zone':None,'atr':atr_v,'last':close,'support':s1,'resistance':r1,'rsi':rsi_v,
-                'trend':trend,'trend_scores':list(context.values()),'context_trends':context,
-                'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'High-precision live filter; historical validation unavailable'}}
-    if direction == 'SELL' and not sell_context and status != 'SIGNAL READY' and not zone_forecast:
-        return {'direction':'NO TRADE','score':0,'status':'WAITING FOR CONFIRMATION',
-                'reasons':['SELL bias rejected by the high-precision filter',
-                          f'MTF bearish alignment: {bear}/5',
-                          f'RSI: {rsi_v:.1f} (preferred SELL range 32-48)',
-                          f'TradingView rating: {rec:.2f}'],
-                'structure':'Insufficient confluence','trigger_text':f'Wait for stronger {trigger_tf} confirmation',
-                'trigger_price':None,'entry_zone':None,'stop_loss':None,'take_profit_1':None,'take_profit_2':None,
-                'next_zone':None,'next_zone_type':None,'candles_to_next_zone':None,'estimated_minutes_to_next_zone':None,
-                'distance_to_next_zone':None,'atr':atr_v,'last':close,'support':s1,'resistance':r1,'rsi':rsi_v,
-                'trend':trend,'trend_scores':list(context.values()),'context_trends':context,
-                'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'High-precision live filter; historical validation unavailable'}}
 
     distance=abs((next_zone or close)-close)
     tf_minutes=TIMEFRAME_MINUTES.get(trigger_tf,15)
     candles=max(1,min(96,math.ceil(distance/max(atr_v,1e-12))))
     rec_confirm = rec >= 0.25 if direction == 'BUY' else rec <= -0.25
-    # Internal score remains 0-100 for ranking/back-end logic. The UI maps it
-    # to qualitative language instead of displaying a confidence percentage.
-    score=min(100,
-              30 + (20 if (buy_rsi_ok if direction=='BUY' else sell_rsi_ok) else 0)
+    # Strength is deliberately kept in a narrow 0-80 display range. It is a
+    # setup-strength heuristic, NOT a probability of winning. A confirmed
+    # entry must reach at least 70; anything below 70 remains a waiting state.
+    raw_score=(30
+              + (20 if (buy_rsi_ok if direction=='BUY' else sell_rsi_ok) else 0)
               + min(25,(bull if direction=='BUY' else bear)*5)
               + (15 if rec_confirm else 0)
               + (10 if status=='SIGNAL READY' else 0))
+    if status == 'SIGNAL READY':
+        # Confirmed setups display only 70-80, never 100/100.
+        score=max(70,min(80,raw_score))
+    elif direction in ('BUY','SELL'):
+        # Forecasts that have not completed the pullback/confirmation remain
+        # below the entry threshold so the UI clearly tells the user to wait.
+        score=max(1,min(69,raw_score))
+    else:
+        score=0
+    if status == 'SIGNAL READY' and score < 70:
+        status='WAITING FOR CONFIRMATION'
+        reasons.append('Setup strength is below the 70% entry threshold; wait for stronger confirmation')
     return {'direction':direction,'score':score,'status':status,'reasons':reasons,
             'structure':'Bullish forecast structure' if direction=='BUY' else 'Bearish forecast structure',
             'trigger_text':trigger_text,'trigger_price':trigger_price,'entry_zone':entry,'stop_loss':stop,

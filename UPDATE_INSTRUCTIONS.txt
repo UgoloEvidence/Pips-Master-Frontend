@@ -140,3 +140,40 @@ HOTFIX 2026-09-22 — MULTI-PAIR SCANNER + STRICT BACKTEST OPTIMIZATION
 - Backtest configurations: strict 3/5 MTF + RSI 52–68 BUY / 32–48 SELL + structure/breakout + ATR 1R; very-strict 4/5 MTF + RSI 54–66 / 34–46; balanced 3/5 with 1.25R target.
 - Historical engine uses verified Yahoo candles and does NOT invent historical TradingView Recommend.All values. The UI labels results as historical validation, not guaranteed future win rate.
 - Backtest endpoint is run on demand with a longer frontend timeout so the scanner's normal live refresh remains fast.
+
+HOTFIX 2026-09-22 — PULLBACK-FIRST MTF + FAST MULTI-PAIR + COMMUNITY SECURITY
+
+1. Scanner entries are now pullback-only:
+   - MTF trend is context, not an entry trigger.
+   - Bullish trend -> wait for demand pullback + bullish rejection before BUY.
+   - Bearish trend -> wait for supply pullback + bearish rejection before SELL.
+   - BUY is blocked when price reaches/approaches supply without rejection.
+   - SELL is blocked when price reaches/approaches demand without rejection.
+   - Forecasts can be invalidated instead of being converted into late market entries.
+
+2. Fast market loading:
+   - Added a TradingView batch request for multiple symbols/timeframes.
+   - Forex scanner defaults to at least six pairs.
+   - Scanner and day-trade pages use the latest cached snapshot immediately, then refresh live in the background.
+   - The UI no longer sits on “waiting for verified data” while an older verified snapshot is available.
+   - A first-ever live provider response still depends on network/provider latency; no fake market data is generated to force a one-second result.
+
+3. Account security:
+   - Persistent browser login token is cleared on site bootstrap so users must enter email/password.
+   - Clicking Login clears any stale browser token and opens a clean credential form.
+   - New account creation returns the user to the Login screen instead of automatically entering the app.
+   - Backend already rejects duplicate email registration and assigns a unique PMA ID.
+
+4. Community:
+   - New users request to join; admin approves/rejects through moderation controls.
+   - Admin can see members and pending requests, approve, warn, suspend, remove and restore members.
+   - Community has a name and group picture, searchable messages, media sharing and disappearing-message settings.
+   - Existing accounts are grandfathered as approved members during database migration.
+   - Voice/video buttons are shown, but real group calling requires a WebRTC signalling layer; the package does not fake a working call.
+
+HOTFIX 2026-09-22 — SAFE STRENGTH RANGE
+- Backend setup strength is now capped at 80; 100/100 is no longer produced.
+- Confirmed SIGNAL READY setups must have strength 70-80.
+- Directional forecasts below 70 remain waiting states and are not entry-ready.
+- Frontend displays the numeric strength as 70-80% for confirmed setups, with explicit waiting text below 70.
+- The percentage is a setup-strength heuristic, not a win probability or guarantee.
