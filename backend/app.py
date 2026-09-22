@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import bcrypt
 from pydantic import BaseModel, EmailStr
 
-from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso
+from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, utc_iso, norm_symbol
 
 ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').lower()
 ADMIN_USERNAME = os.getenv('PMA_ADMIN_USERNAME', 'PipsMaster')
