@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 YAHOO_MAP = {
     'EURUSD':'EURUSD=X','GBPUSD':'GBPUSD=X','USDJPY':'JPY=X','USDCHF':'CHF=X','AUDUSD':'AUDUSD=X','USDCAD':'CAD=X','NZDUSD':'NZDUSD=X',
-    'EURGBP':'EURGBP=X','EURJPY':'EURJPY=X','GBPJPY':'GBPJPY=X','AUDJPY':'AUDJPY=X','EURAUD':'EURAUD=X','GBPAUD':'GBPAUD=X','EURCHF':'EURCHF=X','GBPCHF':'GBPCHF=X',
+    'EURGBP':'EURGBP=X','EURJPY':'EURJPY=X','GBPJPY':'GBPJPY=X','AUDJPY':'AUDJPY=X','EURAUD':'EURAUD=X','GBPAUD':'GBPAUD=X','EURCAD':'EURCAD=X','GBPCAD':'GBPCAD=X','AUDCAD':'AUDCAD=X','AUDNZD':'AUDNZD=X','NZDCAD':'NZDCAD=X','CHFJPY':'CHFJPY=X','CADCHF':'CADCHF=X','GBPNZD':'GBPNZD=X','EURNZD':'EURNZD=X','EURCHF':'EURCHF=X','GBPCHF':'GBPCHF=X',
     'XAUUSD':'GC=F','XAGUSD':'SI=F','XPTUSD':'PL=F','XPDUSD':'PA=F','WTI':'CL=F','USOIL':'CL=F','UKOIL':'BZ=F','BRENT':'BZ=F','NATGAS':'NG=F','COPPER':'HG=F',
     'SPX':'^GSPC','SP500':'^GSPC','SPX500':'^GSPC','NAS100':'^NDX','NDX':'^NDX','US30':'^DJI','DOW':'^DJI','DAX':'^GDAXI','GER40':'^GDAXI','FTSE100':'^FTSE','UK100':'^FTSE','NIKKEI':'^N225','JP225':'^N225','FRA40':'^FCHI',
     'BTCUSD':'BTC-USD','ETHUSD':'ETH-USD','XRPUSD':'XRP-USD','SOLUSD':'SOL-USD','BNBUSD':'BNB-USD','ADAUSD':'ADA-USD','LTCUSD':'LTC-USD'
@@ -365,6 +365,22 @@ def _snapshot_trend(s):
     return 'Neutral'
 
 
+def _closed_candle_pair(symbol, timeframe):
+    """Return the two most recent fully closed candles.
+
+    The live provider can expose the currently forming candle. Sniper confirmation
+    must never use that partial candle. A trigger is therefore evaluated only on a
+    candle whose end time has already passed.
+    """
+    rows = fetch(symbol, timeframe)
+    mins = TIMEFRAME_MINUTES.get(timeframe, 15)
+    now_ts = int(time.time())
+    closed = [r for r in rows if int(r.get('t', 0)) + mins * 60 <= now_ts]
+    if len(closed) < 3:
+        raise ValueError(f'No fully closed {timeframe} candle is available yet')
+    return closed[-2], closed[-1], rows[-1]
+
+
 def candle_confirmation(symbol, timeframe):
     """Use verified historical candles when available to confirm the sniper trigger.
     Returns the last/previous candle relationship without pretending a one-candle
@@ -374,7 +390,7 @@ def candle_confirmation(symbol, timeframe):
         rows = fetch(symbol, timeframe)
         if len(rows) < 3:
             return {'available':False,'reason':'Not enough verified candles'}
-        prev, cur = rows[-2], rows[-1]
+        prev, cur, live = _closed_candle_pair(symbol, timeframe)
         prev_bull = prev['close'] > prev['open']
         prev_bear = prev['close'] < prev['open']
         cur_bull = cur['close'] > cur['open']
@@ -410,10 +426,154 @@ def candle_confirmation(symbol, timeframe):
                 'bullish_mss':bullish_mss,'bearish_mss':bearish_mss,'displacement_up':displacement_up,'displacement_down':displacement_down,
                 'order_block_bullish':order_block_bullish,'order_block_bearish':order_block_bearish,'wyckoff_spring':wyckoff_spring,'wyckoff_upthrust':wyckoff_upthrust,
                 'premium_discount':'discount' if cur['close']<=midpoint else 'premium','vsa_bull':vsa_bull,'vsa_bear':vsa_bear,
-                'previous_open':prev['open'],'previous_close':prev['close'],'current_open':cur['open'],'current_close':cur['close']}
+                'previous_open':prev['open'],'previous_close':prev['close'],'current_open':cur['open'],'current_close':cur['close'],
+                'previous_time':prev.get('t'),'current_time':cur.get('t'),'live_close':live.get('close'),'closed_candle':True,'confirmation_age_seconds':max(0,int(time.time())-(cur.get('t',int(time.time()))+TIMEFRAME_MINUTES.get(timeframe,15)*60))}
     except Exception as exc:
         return {'available':False,'reason':str(exc)}
 
+
+
+def _linreg_slope(values):
+    if len(values) < 3:
+        return 0.0
+    n=len(values); xm=(n-1)/2; ym=sum(values)/n
+    den=sum((i-xm)**2 for i in range(n)) or 1.0
+    return sum((i-xm)*(v-ym) for i,v in enumerate(values))/den
+
+
+def detect_chart_patterns(rows):
+    """Detect common price-action/chart patterns on the selected timeframe.
+
+    These are heuristic pattern recognizers, not standalone trade signals. A pattern
+    can be displayed as confluence, but the main scanner still requires its existing
+    pullback, confirmation-candle, freshness and risk gates before marking READY.
+    """
+    if len(rows) < 30:
+        return []
+    r=rows[-60:]
+    closes=[x['close'] for x in r]
+    highs=[x['high'] for x in r]
+    lows=[x['low'] for x in r]
+    avg=max(mean(closes),1e-12)
+    a=max(atr(r),1e-12)
+    patterns=[]
+
+    def add(name,direction,confidence,description):
+        patterns.append({'name':name,'direction':direction,'confidence':round(float(max(0,min(100,confidence))),1),'description':description})
+
+    # Regression-based wedge / triangle geometry over the latest 24 candles.
+    w=r[-24:]
+    hi_s=_linreg_slope([x['high'] for x in w])/avg
+    lo_s=_linreg_slope([x['low'] for x in w])/avg
+    hi_span=max(x['high'] for x in w)-min(x['high'] for x in w)
+    lo_span=max(x['low'] for x in w)-min(x['low'] for x in w)
+    if hi_s < -0.00008 and lo_s < -0.00004 and abs(hi_s) > abs(lo_s)*1.10 and hi_span>2*a and lo_span>2*a:
+        add('Falling Wedge','BUY',78,'Converging downward boundaries detected; wait for a bullish break/retest or lower-zone confirmation.')
+    if hi_s > 0.00004 and lo_s > 0.00008 and abs(lo_s) > abs(hi_s)*1.10 and hi_span>2*a and lo_span>2*a:
+        add('Rising Wedge','SELL',78,'Converging upward boundaries detected; wait for a bearish break/retest or upper-zone confirmation.')
+    if hi_s < -0.00005 and lo_s > 0.00005 and hi_span>2*a and lo_span>2*a:
+        add('Contracting Triangle','NEUTRAL',72,'Lower highs and higher lows are compressing price; wait for a confirmed breakout and retest.')
+
+    # Local extrema for double-top/bottom and head-and-shoulders style structures.
+    ph=[]; pl=[]
+    for i in range(2,len(r)-2):
+        if highs[i]>=max(highs[i-2:i+3]): ph.append((i,highs[i]))
+        if lows[i]<=min(lows[i-2:i+3]): pl.append((i,lows[i]))
+    tol=max(a*0.65,avg*0.0007)
+    if len(ph)>=2:
+        x1,y1=ph[-2]; x2,y2=ph[-1]
+        if x2-x1>=4 and abs(y2-y1)<=tol:
+            add('Double Top','SELL',76,'Two nearby swing highs detected; confirmation requires a neckline break/retest.')
+    if len(pl)>=2:
+        x1,y1=pl[-2]; x2,y2=pl[-1]
+        if x2-x1>=4 and abs(y2-y1)<=tol:
+            add('Double Bottom','BUY',76,'Two nearby swing lows detected; confirmation requires a neckline break/retest.')
+    if len(ph)>=3:
+        (i1,h1),(i2,h2),(i3,h3)=ph[-3:]
+        shoulder=max(abs(h1-h3),tol*0.5)
+        if i2-i1>=3 and i3-i2>=3 and h2>h1+tol*0.5 and h2>h3+tol*0.5 and abs(h1-h3)<=tol*1.25:
+            add('Head & Shoulders','SELL',80,'Three-peak structure with a higher middle peak detected; neckline confirmation is required.')
+    if len(pl)>=3:
+        (i1,l1),(i2,l2),(i3,l3)=pl[-3:]
+        if i2-i1>=3 and i3-i2>=3 and l2<l1-tol*0.5 and l2<l3-tol*0.5 and abs(l1-l3)<=tol*1.25:
+            add('Inverse Head & Shoulders','BUY',80,'Three-trough structure with a lower middle trough detected; neckline confirmation is required.')
+
+    # Flags / pennants: strong impulse followed by a compact correction.
+    if len(r)>=18:
+        impulse=r[-18:-8]; corr=r[-8:]
+        impulse_move=impulse[-1]['close']-impulse[0]['close']
+        corr_move=corr[-1]['close']-corr[0]['close']
+        corr_range=max(x['high'] for x in corr)-min(x['low'] for x in corr)
+        if impulse_move>3*a and abs(corr_move)<abs(impulse_move)*0.45 and corr_range<abs(impulse_move)*0.75:
+            add('Bull Flag','BUY',74,'Strong bullish impulse followed by a compact pullback; wait for continuation confirmation.')
+        if impulse_move<-3*a and abs(corr_move)<abs(impulse_move)*0.45 and corr_range<abs(impulse_move)*0.75:
+            add('Bear Flag','SELL',74,'Strong bearish impulse followed by a compact pullback; wait for continuation confirmation.')
+
+    # Breakout/retest and failed-break patterns.
+    prior_hi=max(x['high'] for x in r[-21:-3]); prior_lo=min(x['low'] for x in r[-21:-3])
+    recent=r[-3:]; last=recent[-1]
+    near_hi=abs(last['close']-prior_hi)<=a*0.35
+    near_lo=abs(last['close']-prior_lo)<=a*0.35
+    if max(x['high'] for x in recent)>prior_hi and last['close']>prior_hi:
+        add('Breakout / Retest','BUY',73,'Recent high was broken and price remains above the breakout area; retest confirmation is required.')
+    if min(x['low'] for x in recent)<prior_lo and last['close']<prior_lo:
+        add('Breakdown / Retest','SELL',73,'Recent low was broken and price remains below the breakdown area; retest confirmation is required.')
+    if max(x['high'] for x in recent)>prior_hi and last['close']<prior_hi:
+        add('Failed Break / Bull Trap','SELL',75,'Price swept a recent high but closed back below it; bearish confirmation is still required.')
+    if min(x['low'] for x in recent)<prior_lo and last['close']>prior_lo:
+        add('Failed Break / Bear Trap','BUY',75,'Price swept a recent low but closed back above it; bullish confirmation is still required.')
+
+    # Range/consolidation.
+    rg=max(x['high'] for x in r[-20:])-min(x['low'] for x in r[-20:])
+    if rg <= max(a*7.0,avg*0.004):
+        add('Range / Consolidation','NEUTRAL',68,'Price is compressed in a range; wait for a clean rejection or confirmed breakout.')
+
+    # Deduplicate by pattern name while keeping the strongest observation.
+    best={}
+    for item in patterns:
+        if item['name'] not in best or item['confidence']>best[item['name']]['confidence']:
+            best[item['name']]=item
+    return sorted(best.values(),key=lambda x:x['confidence'],reverse=True)[:6]
+
+def _enhanced_context(symbol, trigger_tf, direction, close, atr_v):
+    """Verified-candle confluence used as a second gate for live setups.
+    This is deliberately conservative: missing data means the extra confirmation is unavailable.
+    """
+    try:
+        rows=fetch(symbol, trigger_tf)
+        if len(rows)<40:
+            return {'available':False,'reason':'Not enough verified candles'}
+        recent=rows[-40:]
+        hi=max(r['high'] for r in recent); lo=min(r['low'] for r in recent)
+        rng=max(hi-lo,1e-12)
+        # 50% to 61.8% retracement measured from the recent impulse leg.
+        if direction=='BUY':
+            mid50=hi-rng*0.50
+            fib618=hi-rng*0.618
+        else:
+            mid50=lo+rng*0.50
+            fib618=lo+rng*0.618
+        zone_low=min(mid50,fib618); zone_high=max(mid50,fib618)
+        in_fib=zone_low-atr_v*0.12 <= close <= zone_high+atr_v*0.12
+        cc=candle_confirmation(symbol,trigger_tf)
+        patterns=detect_chart_patterns(rows)
+        regime='TRENDING' if direction in ('BUY','SELL','BULLISH','BEARISH') else 'RANGING'
+        # Range detection: recent high/low compression relative to ATR.
+        ranges=[r['high']-r['low'] for r in recent[-14:]]
+        avg_range=mean(ranges) if ranges else atr_v
+        compressed=(rng <= max(atr_v*5.0, avg_range*8.0))
+        if zone_low <= close <= zone_high: location='50–61.8% retracement'
+        elif in_fib: location='near 50–61.8% retracement'
+        else: location='outside primary retracement zone'
+        bull_conf=sum(bool(cc.get(k)) for k in ('bullish_engulfing','bullish_rejection','bullish_sweep','bullish_mss','displacement_up','bullish_fvg','vsa_bull'))
+        bear_conf=sum(bool(cc.get(k)) for k in ('bearish_engulfing','bearish_rejection','bearish_sweep','bearish_mss','displacement_down','bearish_fvg','vsa_bear'))
+        confirmations=bull_conf if direction=='BUY' else bear_conf if direction=='SELL' else max(bull_conf,bear_conf)
+        pattern_conf=sum(1 for p in patterns if p.get('direction') in (direction,'NEUTRAL'))
+        return {'available':True,'fib50':mid50,'fib618':fib618,'fib_zone_low':zone_low,'fib_zone_high':zone_high,
+                'in_fib_zone':in_fib,'retracement_location':location,'regime':regime,'compressed':compressed,
+                'confirmations':confirmations,'pattern_confidence':pattern_conf,'patterns':patterns,'candle':cc}
+    except Exception as ex:
+        return {'available':False,'reason':str(ex)}
 
 def _tv_setup(symbol, market, trigger_tf, snaps):
     """Create a forecast-first setup instead of chasing price at a zone.
@@ -468,6 +628,23 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
         candle_conf = candle_confirmation(symbol, trigger_tf)
     bullish_sniper = bullish_rejection and candle_conf.get('available') and candle_conf.get('bullish_engulfing')
     bearish_sniper = bearish_rejection and candle_conf.get('available') and candle_conf.get('bearish_engulfing')
+    enhanced=_enhanced_context(symbol, trigger_tf, 'BUY' if buy_context else ('SELL' if sell_context else trend.upper()), close, atr_v)
+    candle_conf = enhanced.get('candle', candle_conf) if enhanced.get('available') else candle_conf
+    confirmed_close = candle_conf.get('current_close') if candle_conf.get('closed_candle') else None
+    confirmation_age = candle_conf.get('confirmation_age_seconds') if candle_conf.get('closed_candle') else None
+    tf_seconds = TIMEFRAME_MINUTES.get(trigger_tf, 15) * 60
+    confirmation_fresh = bool(candle_conf.get('closed_candle')) and confirmation_age is not None and confirmation_age <= tf_seconds
+    # The decisive candle must have CLOSED. Never trigger from an in-progress candle.
+    bullish_sniper = bool(candle_conf.get('available') and candle_conf.get('bullish_rejection') and candle_conf.get('bullish_engulfing') and confirmation_fresh)
+    bearish_sniper = bool(candle_conf.get('available') and candle_conf.get('bearish_rejection') and candle_conf.get('bearish_engulfing') and confirmation_fresh)
+    fib_ok=bool(enhanced.get('in_fib_zone')) if enhanced.get('available') else False
+    # A confirmed setup may use the 50–61.8% zone as confluence, but it is never
+    # allowed to be the only reason for an entry.
+    if enhanced.get('available'):
+        if fib_ok: reasons.append('Verified 50–61.8% retracement confluence detected')
+        if enhanced.get('confirmations',0)>=2: reasons.append(f"Lower-timeframe confirmation cluster: {enhanced.get('confirmations')}")
+        for ptn in (enhanced.get('patterns') or [])[:3]:
+            reasons.append(f"Chart pattern detected: {ptn['name']} ({ptn['direction']})")
 
     # Opposing-zone protection: once an uptrend reaches supply, do not issue BUY;
     # once a downtrend reaches demand, do not issue SELL. Wait for a fresh setup.
@@ -533,6 +710,23 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
         reasons=['Confluence is insufficient for a pullback forecast',f'Trigger timeframe trend: {trend}',f'TradingView technical rating: {rec:.2f}']
         trigger_text=f'Wait for clearer {trigger_tf} structure and a pullback zone'
 
+    # Fresh-entry gate: once the confirming candle is no longer the latest closed
+    # candle, or price has already travelled materially away from the confirmed
+    # close, the setup expires. The scanner must wait for a new pullback/retest.
+    late_entry_blocked = False
+    if status == 'SIGNAL READY' and confirmed_close is not None:
+        live_price = float(close)
+        travel = abs(live_price - confirmed_close)
+        max_travel = max(atr_v * 0.35, abs(confirmed_close) * 0.00008)
+        if (not confirmation_fresh) or travel > max_travel:
+            late_entry_blocked = True
+            direction = 'NO TRADE'
+            status = 'LATE ENTRY BLOCKED'
+            entry = stop = tp1 = tp2 = None
+            reasons.append('Late-entry protection: the confirmed candle is no longer fresh or price has already moved too far')
+            reasons.append('Wait for a new pullback/rejection and a new candle-close confirmation')
+            trigger_text = 'LATE ENTRY BLOCKED — wait for a fresh pullback and a newly closed confirmation candle'
+
     if direction == 'NO TRADE':
         distance=abs((next_zone or close)-close)
         tf_minutes=TIMEFRAME_MINUTES.get(trigger_tf,15)
@@ -542,6 +736,7 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
                 'take_profit_1':tp1,'take_profit_2':tp2,'next_zone':next_zone,'next_zone_type':zone_type,'candles_to_next_zone':candles,
                 'estimated_minutes_to_next_zone':candles*tf_minutes,'distance_to_next_zone':distance,'atr':atr_v,'last':close,'support':s1,'resistance':r1,
                 'rsi':rsi_v,'trend':trend,'trend_scores':list(context.values()),'context_trends':context,
+                'confirmation_candle_time': enhanced.get('candle',{}).get('current_time'),'confirmation_candle_closed': bool(enhanced.get('candle',{}).get('closed_candle')),'confirmation_age_seconds': enhanced.get('candle',{}).get('confirmation_age_seconds'),'entry_fresh': bool(status=='SIGNAL READY' and not late_entry_blocked),'late_entry_blocked': late_entry_blocked,
                 'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'Live TradingView snapshot; historical backtest unavailable'}}
 
     distance=abs((next_zone or close)-close)
@@ -551,20 +746,25 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
     # Strength is deliberately kept in a narrow 0-80 display range. It is a
     # setup-strength heuristic, NOT a probability of winning. A confirmed
     # entry must reach at least 70; anything below 70 remains a waiting state.
-    raw_score=(30
-              + (20 if (buy_rsi_ok if direction=='BUY' else sell_rsi_ok) else 0)
-              + min(25,(bull if direction=='BUY' else bear)*5)
-              + (15 if rec_confirm else 0)
+    raw_score=(20
+              + (12 if (buy_rsi_ok if direction=='BUY' else sell_rsi_ok) else 0)
+              + min(20,(bull if direction=='BUY' else bear)*4)
+              + (12 if rec_confirm else 0)
+              + (12 if fib_ok else 0)
+              + min(14, int(enhanced.get('confirmations',0))*2 if enhanced.get('available') else 0)
+              + min(12, int(enhanced.get('pattern_confidence',0))*3 if enhanced.get('available') else 0)
               + (10 if status=='SIGNAL READY' else 0))
     if status == 'SIGNAL READY':
-        # Confirmed setups display only 70-80, never 100/100.
-        score=max(70,min(80,raw_score))
+        score=max(70,min(100,raw_score))
     elif direction in ('BUY','SELL'):
-        # Forecasts that have not completed the pullback/confirmation remain
-        # below the entry threshold so the UI clearly tells the user to wait.
-        score=max(1,min(69,raw_score))
+        score=max(1,min(79,raw_score))
     else:
         score=0
+    # Critical confirmation vetoes prevent a pretty score from becoming a trade.
+    if status=='SIGNAL READY' and (not fib_ok or (enhanced.get('confirmations',0)<1)):
+        status='WAITING FOR CONFIRMATION'
+        reasons.append('Critical confirmation gate not complete: retracement/candle evidence is insufficient')
+        score=min(score,79)
     if status == 'SIGNAL READY' and score < 70:
         status='WAITING FOR CONFIRMATION'
         reasons.append('Setup strength is below the 70% entry threshold; wait for stronger confirmation')
@@ -575,8 +775,17 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
             'candles_to_next_zone':candles,'estimated_minutes_to_next_zone':candles*tf_minutes,
             'distance_to_next_zone':distance,'atr':atr_v,'last':close,'support':s1,'resistance':r1,'rsi':rsi_v,
             'trend':trend,'trend_scores':list(context.values()),'context_trends':context,
+            'confirmation_candle_time': enhanced.get('candle',{}).get('current_time'),'confirmation_candle_closed': bool(enhanced.get('candle',{}).get('closed_candle')),'confirmation_age_seconds': enhanced.get('candle',{}).get('confirmation_age_seconds'),'entry_fresh': bool(status=='SIGNAL READY' and not late_entry_blocked),'late_entry_blocked': late_entry_blocked,
             'validation':{'samples':0,'wins':0,'losses':0,'win_rate':None,'rule':'Live TradingView snapshot; no historical result is presented as a backtest'},
-            'available_strategies':['Supply/Demand','Order Blocks / IOF retest','Fair Value Gaps','Premium / Discount','Liquidity Sweeps','MSS / CHoCH','Wyckoff spring/upthrust','VSA volume confirmation','Breakout / Retest'],
+            'available_strategies':['Supply/Demand','Order Blocks / IOF retest','Fair Value Gaps','Premium / Discount','Liquidity Sweeps','MSS / CHoCH','Wyckoff spring/upthrust','VSA volume confirmation','Breakout / Retest','Falling/Rising Wedges','Triangles','Flags / Pennants','Double Tops / Bottoms','Head & Shoulders','Failed Breaks / Traps'],
+            'detected_patterns':enhanced.get('patterns',[]),'pattern_count':len(enhanced.get('patterns',[])),
+            'market_regime': enhanced.get('regime','UNKNOWN'),
+            'fib_50': enhanced.get('fib50'),'fib_618': enhanced.get('fib618'),'fib_zone_low': enhanced.get('fib_zone_low'),'fib_zone_high': enhanced.get('fib_zone_high'),
+            'in_retracement_zone': bool(enhanced.get('in_fib_zone')),'retracement_location':enhanced.get('retracement_location',''),
+            'liquidity_sweep': bool(candle_conf.get('bullish_sweep') or candle_conf.get('bearish_sweep')),'mss_choch': bool(candle_conf.get('bullish_mss') or candle_conf.get('bearish_mss')),
+            'displacement_confirmation': bool(candle_conf.get('displacement_up') or candle_conf.get('displacement_down')),
+            'fvg_confirmation': bool(candle_conf.get('bullish_fvg') or candle_conf.get('bearish_fvg')),
+            'news_filter':'NOT_CONNECTED','spread_filter':'DATA_PROVIDER_DEPENDENT',
             'strategy_state': 'SNIPER CONFIRMED' if (bullish_sniper or bearish_sniper) else ('ZONE REJECTION' if (bullish_rejection or bearish_rejection) else 'WAITING'),
             'strategy_confluence': [x for x in [
                 'Supply/Demand pullback' if (demand_reached or supply_reached) else None,
@@ -590,6 +799,7 @@ def _tv_setup(symbol, market, trigger_tf, snaps):
                 'Candle rejection' if (bullish_rejection or bearish_rejection) else None,
                 'Bullish/Bearish engulfing confirmation' if (candle_conf.get('bullish_engulfing') or candle_conf.get('bearish_engulfing')) else None,
                 'VSA volume confirmation' if (candle_conf.get('vsa_bull') or candle_conf.get('vsa_bear')) else None,
+                *[f"Pattern: {p['name']}" for p in (enhanced.get('patterns') or [])[:3]],
             ] if x]}
 
 

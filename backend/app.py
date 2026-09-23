@@ -13,7 +13,7 @@ from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, u
 ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').lower()
 ADMIN_USERNAME = os.getenv('PMA_ADMIN_USERNAME', 'PipsMaster')
 ADMIN_FULL_NAME = os.getenv('PMA_ADMIN_FULL_NAME', 'Ugolo Evidence')
-ADMIN_PASSWORD = os.getenv('PMA_ADMIN_PASSWORD', 'march62010')
+ADMIN_PASSWORD = os.getenv('PMA_ADMIN_PASSWORD', 'my62020')
 TOKEN_SECRET = os.getenv('PMA_SECRET_KEY', '') or 'pma-dev-secret-change-this-in-render'
 TOKEN_TTL = int(os.getenv('PMA_TOKEN_TTL', str(60*60*24*30)))
 VAPID_PUBLIC_KEY = os.getenv('PMA_VAPID_PUBLIC_KEY') or os.getenv('VAPID_PUBLIC_KEY') or 'BDuFoIUEKTsHTSl5SXZEIWNaYK317R0F5gnOLgD0iqXHXCsP49bo7mLfIDFG54DPvpEOGO4Qo4HFudz4iRnGCBI'
@@ -98,6 +98,22 @@ class Msg(BaseModel):
     media_data: str = ''
     media_type: str = ''
     reply_to_id: int = 0
+    temporary: bool = False
+
+class PrivateMessage(BaseModel):
+    text: str
+
+class MessageRequestModel(BaseModel):
+    user_id: int
+
+class RequestDecision(BaseModel):
+    action: str
+
+class CommunityMessageAction(BaseModel):
+    text: str = ''
+
+class CommunityReaction(BaseModel):
+    emoji: str
 
 class CommunityRequest(BaseModel):
     action: str = 'request'
@@ -111,7 +127,9 @@ class CommunitySettings(BaseModel):
     name: str = 'PMA Community'
     bio: str = 'A place for PMA members to learn, share and discuss the markets.'
     profile_picture: str = ''
-    disappearing_seconds: int = 604800
+    disappearing_seconds: int = 86400
+    temporary_enabled: bool = False
+    temporary_seconds: int = 86400
 
 
 class Profile(BaseModel):
@@ -148,16 +166,16 @@ def db():
     c=sqlite3.connect(DB,timeout=30,check_same_thread=False)
     c.row_factory=sqlite3.Row
     c.execute('PRAGMA busy_timeout=30000')
-    c.execute('PRAGMA journal_mode=WAL')
-    c.execute('PRAGMA synchronous=NORMAL')
     if not _DB_READY:
         with _DB_INIT_LOCK:
             if not _DB_READY:
+                c.execute('PRAGMA journal_mode=WAL')
+                c.execute('PRAGMA synchronous=NORMAL')
                 c.executescript('''
                 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, full_name TEXT, email TEXT UNIQUE, password TEXT, pma_id TEXT UNIQUE, referral_code TEXT UNIQUE, referrer TEXT, role TEXT DEFAULT 'user', phone TEXT DEFAULT '', dob TEXT DEFAULT '', profile_picture TEXT DEFAULT '', created INTEGER, xp INTEGER DEFAULT 0, last_active INTEGER DEFAULT 0, login_count INTEGER DEFAULT 0, activity_count INTEGER DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '', media_type TEXT DEFAULT '', reply_to_id INTEGER DEFAULT 0, edited INTEGER DEFAULT 0, created INTEGER);
+                CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '', media_type TEXT DEFAULT '', reply_to_id INTEGER DEFAULT 0, edited INTEGER DEFAULT 0, created INTEGER, temporary INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0, deleted_by TEXT DEFAULT '', deleted_at INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS community_members(user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member', warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0, note TEXT DEFAULT '');
-                CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.', profile_picture TEXT DEFAULT '', disappearing_seconds INTEGER DEFAULT 604800, updated_at INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.', profile_picture TEXT DEFAULT '', disappearing_seconds INTEGER DEFAULT 86400, temporary_enabled INTEGER DEFAULT 0, temporary_seconds INTEGER DEFAULT 86400, updated_at INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0, target_page TEXT DEFAULT '', target_ref TEXT DEFAULT ''); CREATE TABLE IF NOT EXISTS push_subscriptions(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created INTEGER DEFAULT 0, updated INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE IF NOT EXISTS referrals(id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, referred_id INTEGER NOT NULL, challenge_month TEXT NOT NULL, status TEXT DEFAULT 'pending', created INTEGER NOT NULL, qualification_due INTEGER NOT NULL, qualified_at INTEGER, flagged INTEGER DEFAULT 0, reason TEXT DEFAULT '', UNIQUE(referrer_id,referred_id));
@@ -172,8 +190,12 @@ def db():
                 message_existing={r['name'] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
                 if 'reply_to_id' not in message_existing: c.execute("ALTER TABLE messages ADD COLUMN reply_to_id INTEGER DEFAULT 0")
                 if 'edited' not in message_existing: c.execute("ALTER TABLE messages ADD COLUMN edited INTEGER DEFAULT 0")
+                for name,ddl in {'temporary':'ALTER TABLE messages ADD COLUMN temporary INTEGER DEFAULT 0','expires_at':'ALTER TABLE messages ADD COLUMN expires_at INTEGER DEFAULT 0','deleted':'ALTER TABLE messages ADD COLUMN deleted INTEGER DEFAULT 0','deleted_by':'ALTER TABLE messages ADD COLUMN deleted_by TEXT DEFAULT ''','deleted_at':'ALTER TABLE messages ADD COLUMN deleted_at INTEGER DEFAULT 0'}.items():
+                    if name not in message_existing: c.execute(ddl)
                 community_settings_existing={r['name'] for r in c.execute("PRAGMA table_info(community_settings)").fetchall()}
                 if 'bio' not in community_settings_existing: c.execute("ALTER TABLE community_settings ADD COLUMN bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.'")
+                if 'temporary_enabled' not in community_settings_existing: c.execute("ALTER TABLE community_settings ADD COLUMN temporary_enabled INTEGER DEFAULT 0")
+                if 'temporary_seconds' not in community_settings_existing: c.execute("ALTER TABLE community_settings ADD COLUMN temporary_seconds INTEGER DEFAULT 86400")
                 notif_existing={r['name'] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
                 if 'target_page' not in notif_existing: c.execute("ALTER TABLE notifications ADD COLUMN target_page TEXT DEFAULT ''")
                 if 'target_ref' not in notif_existing: c.execute("ALTER TABLE notifications ADD COLUMN target_ref TEXT DEFAULT ''")
@@ -182,25 +204,32 @@ def db():
                     if name not in existing: c.execute(ddl)
                 now=int(time.time())
                 c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('history_retention_enabled','1')")
-                c.execute("INSERT OR IGNORE INTO community_settings(id,name,bio,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','A place for PMA members to learn, share and discuss the markets.','',604800,?)",(now,))
-                if c.execute("SELECT 1 FROM settings WHERE key='community_default_retention_v1'").fetchone() is None:
-                    c.execute("UPDATE community_settings SET disappearing_seconds=604800 WHERE id=1 AND COALESCE(disappearing_seconds,0)=0")
-                    c.execute("INSERT INTO settings(key,value) VALUES('community_default_retention_v1','1')")
+                c.execute("INSERT OR IGNORE INTO community_settings(id,name,bio,profile_picture,disappearing_seconds,temporary_enabled,temporary_seconds,updated_at) VALUES(1,'PMA Community','A place for PMA members to learn, share and discuss the markets.','',86400,0,86400,?)",(now,))
+                c.execute("UPDATE community_settings SET disappearing_seconds=86400, temporary_seconds=86400 WHERE id=1")
                 c.execute("INSERT OR IGNORE INTO community_members(user_id,status,role,joined_at,updated_at) SELECT id,'approved',CASE WHEN role='admin' THEN 'admin' ELSE 'member' END,?,? FROM users",(now,now))
                 c.execute('DELETE FROM notifications WHERE created < ?',(now-14*86400,))
                 c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(username,created DESC)')
                 c.execute('CREATE INDEX IF NOT EXISTS idx_trade_history_user_closed ON trade_history(user_id,closed_at DESC)')
                 c.execute('CREATE INDEX IF NOT EXISTS idx_referrals_referrer_status_month ON referrals(referrer_id,status,challenge_month)')
                 c.execute('CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created DESC)')
+                c.execute('''CREATE TABLE IF NOT EXISTS message_requests(id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL, receiver_id INTEGER NOT NULL, status TEXT DEFAULT 'pending', created INTEGER NOT NULL, responded INTEGER DEFAULT 0, UNIQUE(sender_id,receiver_id))''')
+                c.execute('''CREATE TABLE IF NOT EXISTS private_conversations(id INTEGER PRIMARY KEY, user_a INTEGER NOT NULL, user_b INTEGER NOT NULL, created INTEGER NOT NULL, last_message INTEGER DEFAULT 0, UNIQUE(user_a,user_b))''')
+                c.execute('''CREATE TABLE IF NOT EXISTS private_messages(id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, receiver_id INTEGER NOT NULL, text TEXT NOT NULL, created INTEGER NOT NULL, edited INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0, deleted_by TEXT DEFAULT '')''')
+                c.execute('''CREATE TABLE IF NOT EXISTS message_reactions(id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, user_id INTEGER NOT NULL, emoji TEXT NOT NULL, created INTEGER NOT NULL, UNIQUE(message_id,user_id,emoji))''')
+                c.execute('''CREATE TABLE IF NOT EXISTS message_views(id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, user_id INTEGER NOT NULL, viewed INTEGER NOT NULL, UNIQUE(message_id,user_id))''')
                 c.execute('CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created DESC)')
                 c.execute('CREATE INDEX IF NOT EXISTS idx_signal_history_user_created ON signal_history(user_id,created DESC)')
                 if ADMIN_PASSWORD:
                     ar=c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(ADMIN_EMAIL,)).fetchone()
                     if ar:
                         c.execute('UPDATE users SET username=?,full_name=?,role=? WHERE id=?',(ADMIN_USERNAME,ADMIN_FULL_NAME,'admin',ar['id']))
-                        if not verify_password(ADMIN_PASSWORD,ar['password']): c.execute('UPDATE users SET password=? WHERE id=?',(hash_password(ADMIN_PASSWORD),ar['id']))
+                        # One-time credential migration for this rebuild. After the marker is set, user-changed passwords are preserved.
+                        if c.execute("SELECT 1 FROM settings WHERE key='admin_password_migration_v3'").fetchone() is None:
+                            c.execute('UPDATE users SET password=? WHERE id=?',(hash_password(ADMIN_PASSWORD),ar['id']))
+                            c.execute("INSERT INTO settings(key,value) VALUES('admin_password_migration_v3','1')")
                     else:
                         c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(ADMIN_USERNAME,ADMIN_FULL_NAME,ADMIN_EMAIL,hash_password(ADMIN_PASSWORD),'PMA-ADMIN001','PMAADMIN001','', 'admin',now,0,now,0,1))
+                        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('admin_password_migration_v3','1')")
                 c.commit(); _DB_READY=True
     return c
 
@@ -458,14 +487,39 @@ def signup(x: Signup):
 
 @app.post('/api/auth/login')
 def login(x: Login):
-    c = db(); row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(str(x.email),)).fetchone()
-    if not row or not verify_password(x.password,row['password']): c.close(); raise HTTPException(401,'Email or password is incorrect.')
-    now = int(time.time())
-    c.execute('UPDATE users SET last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,row['id']))
-    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
-    push_notice(c,row['username'],'New login','Your account was signed in successfully.','security'); c.commit(); c.close()
-    token=make_token(row['id'])
-    return {'user':user_out(row),'token':token}
+    email=str(x.email).strip().lower()
+    # Retry SQLite busy errors and keep external push work out of the login transaction.
+    # The admin account is deterministically seeded during DB initialization.
+    last_error=None
+    for attempt in range(5):
+        c=None
+        try:
+            c=db(); row=c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(email,)).fetchone()
+            if not row or not verify_password(x.password,row['password']):
+                c.close(); raise HTTPException(401,'Email or password is incorrect.')
+            now=int(time.time())
+            c.execute('UPDATE users SET last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,row['id']))
+            c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
+            c.commit()
+            c.close()
+            token=make_token(row['id'])
+            return {'user':user_out(row),'token':token}
+        except HTTPException:
+            raise
+        except sqlite3.OperationalError as ex:
+            last_error=ex
+            try:
+                if c: c.rollback(); c.close()
+            except Exception: pass
+            if 'locked' not in str(ex).lower() or attempt==4:
+                raise HTTPException(503,'Login service is temporarily busy. Please retry in a moment.')
+            time.sleep(0.25*(attempt+1))
+        except Exception as ex:
+            try:
+                if c: c.close()
+            except Exception: pass
+            raise HTTPException(500,'Login service could not complete the request.')
+    raise HTTPException(503,f'Login service is temporarily busy: {last_error}')
 
 
 @app.post('/api/auth/logout')
@@ -620,6 +674,9 @@ def prepare_market_setup(symbol, market, trigger_timeframe='15m', tv_snaps=None)
             'trend_detail':{tf:{'trend':trends[tf], 'rsi':snaps[tf].get('rsi'), 'close':snaps[tf].get('close'), 'ema20':snaps[tf].get('ema20'), 'ema50':snaps[tf].get('ema50')} for tf in snaps},
             'trend_alignment':f"{sum(1 for v in setup['context_trends'].values() if v==setup['trend'])}/5" if setup['trend'] != 'Neutral' else '0/5',
             'validation':setup['validation'],'data_source':'Verified TradingView scanner feed','updated_at':utc_iso(),
+            'market_regime':setup.get('market_regime','UNKNOWN'),'fib_50':setup.get('fib_50'),'fib_618':setup.get('fib_618'),'fib_zone_low':setup.get('fib_zone_low'),'fib_zone_high':setup.get('fib_zone_high'),
+            'in_retracement_zone':setup.get('in_retracement_zone',False),'retracement_location':setup.get('retracement_location',''),'liquidity_sweep':setup.get('liquidity_sweep',False),'mss_choch':setup.get('mss_choch',False),'displacement_confirmation':setup.get('displacement_confirmation',False),'fvg_confirmation':setup.get('fvg_confirmation',False),'news_filter':setup.get('news_filter','NOT_CONNECTED'),'spread_filter':setup.get('spread_filter','DATA_PROVIDER_DEPENDENT'),
+            'strategy_confluence':setup.get('strategy_confluence',[]),'detected_patterns':setup.get('detected_patterns',[]),'pattern_count':setup.get('pattern_count',0),'strategy_state':setup.get('strategy_state','WAITING'),'confirmation_candle_time':setup.get('confirmation_candle_time'),'confirmation_candle_closed':setup.get('confirmation_candle_closed',False),'confirmation_age_seconds':setup.get('confirmation_age_seconds'),'entry_fresh':setup.get('entry_fresh',False),'late_entry_blocked':setup.get('late_entry_blocked',False),
             'method':'PMA confluence engine: TradingView MTF trend + RSI + technical rating + pivot trigger + ATR risk structure'
         }
     except Exception as tv_error:
@@ -658,6 +715,9 @@ def prepare_market_setup(symbol, market, trigger_timeframe='15m', tv_snaps=None)
                 'trend_detail':{tf:{'trend':trends[tf], 'rsi':snaps[tf].get('rsi'), 'close':snaps[tf].get('close'), 'ema20':snaps[tf].get('ema20'), 'ema50':snaps[tf].get('ema50')} for tf in snaps},
                 'trend_alignment':f"{sum(1 for v in setup['context_trends'].values() if v==setup['trend'])}/5" if setup['trend'] != 'Neutral' else '0/5',
                 'validation':setup['validation'],'data_source':'Verified Yahoo Finance OHLC fallback','updated_at':utc_iso(),
+                'market_regime':setup.get('market_regime','UNKNOWN'),'fib_50':setup.get('fib_50'),'fib_618':setup.get('fib_618'),'fib_zone_low':setup.get('fib_zone_low'),'fib_zone_high':setup.get('fib_zone_high'),
+                'in_retracement_zone':setup.get('in_retracement_zone',False),'retracement_location':setup.get('retracement_location',''),'liquidity_sweep':setup.get('liquidity_sweep',False),'mss_choch':setup.get('mss_choch',False),'displacement_confirmation':setup.get('displacement_confirmation',False),'fvg_confirmation':setup.get('fvg_confirmation',False),'news_filter':setup.get('news_filter','NOT_CONNECTED'),'spread_filter':setup.get('spread_filter','DATA_PROVIDER_DEPENDENT'),
+                'strategy_confluence':setup.get('strategy_confluence',[]),'detected_patterns':setup.get('detected_patterns',[]),'pattern_count':setup.get('pattern_count',0),'strategy_state':setup.get('strategy_state','WAITING'),'confirmation_candle_time':setup.get('confirmation_candle_time'),'confirmation_candle_closed':setup.get('confirmation_candle_closed',False),'confirmation_age_seconds':setup.get('confirmation_age_seconds'),'entry_fresh':setup.get('entry_fresh',False),'late_entry_blocked':setup.get('late_entry_blocked',False),
                 'method':'PMA confluence engine: verified OHLC trend + RSI + structure + MTF alignment + ATR zone projection'
             }
         except Exception as yahoo_error:
@@ -947,6 +1007,24 @@ def history_retention_enabled(c):
     r=c.execute("SELECT value FROM settings WHERE key='history_retention_enabled'").fetchone()
     return str(r['value'])!='0' if r else True
 
+@app.get('/api/scanner/analytics')
+def scanner_analytics(req: Request, days: int=30):
+    u=current(req); days=max(1,min(365,int(days or 30))); cutoff=int(time.time())-days*86400
+    c=db()
+    trades=c.execute('SELECT * FROM trade_history WHERE user_id=? AND closed_at>=? ORDER BY closed_at DESC',(u['id'],cutoff)).fetchall()
+    signals=c.execute('SELECT * FROM signal_history WHERE (user_id=? OR user_id IS NULL) AND created>=? ORDER BY created DESC',(u['id'],cutoff)).fetchall(); c.close()
+    wins=sum(1 for r in trades if r['outcome']=='take_profit' or r['outcome']=='close_in_profit')
+    losses=sum(1 for r in trades if r['outcome']=='stop_loss' or r['outcome']=='close_in_loss')
+    closed=wins+losses
+    by_tf={}; by_dir={}; by_market={};
+    for r in trades:
+        for bucket,key in ((by_tf,r['timeframe']),(by_dir,r['direction']),(by_market,r['market'])):
+            z=bucket.setdefault(key,{'trades':0,'wins':0,'losses':0}); z['trades']+=1; z['wins']+=int(r['outcome'] in ('take_profit','close_in_profit')); z['losses']+=int(r['outcome'] in ('stop_loss','close_in_loss'))
+    def finish(x):
+        for v in x.values(): v['win_rate']=round(v['wins']*100/max(v['wins']+v['losses'],1),1) if v['wins']+v['losses'] else None
+        return x
+    return {'days':days,'closed_trades':len(trades),'wins':wins,'losses':losses,'win_rate':round(wins*100/closed,1) if closed else None,'signals':len(signals),'by_timeframe':finish(by_tf),'by_direction':finish(by_dir),'by_market':finish(by_market),'note':'Historical measurements only; not a prediction of future results.'}
+
 @app.get('/api/history/settings')
 def history_settings(req: Request):
     u=current(req); c=db(); enabled=history_retention_enabled(c); c.close(); return {'enabled':enabled,'days':7}
@@ -970,7 +1048,7 @@ def history_all(req: Request, days: int=7):
 
 def community_settings_row(c):
     r=c.execute('SELECT * FROM community_settings WHERE id=1').fetchone()
-    return {'name':r['name'] if r else 'PMA Community','bio':r['bio'] if r and 'bio' in r.keys() else 'A place for PMA members to learn, share and discuss the markets.','profile_picture':r['profile_picture'] if r else '', 'disappearing_seconds':int(r['disappearing_seconds'] or 0) if r else 604800}
+    return {'name':r['name'] if r else 'PMA Community','bio':r['bio'] if r and 'bio' in r.keys() else 'A place for PMA members to learn, share and discuss the markets.','profile_picture':r['profile_picture'] if r else '', 'disappearing_seconds':int(r['disappearing_seconds'] or 0) if r else 86400,'temporary_enabled':bool(r['temporary_enabled']) if r and 'temporary_enabled' in r.keys() else False,'temporary_seconds':int(r['temporary_seconds'] or 86400) if r and 'temporary_seconds' in r.keys() else 86400}
 
 def community_member(c,user_id):
     return c.execute('SELECT * FROM community_members WHERE user_id=?',(user_id,)).fetchone()
@@ -1011,21 +1089,24 @@ def community_member_list(req: Request):
 
 @app.get('/api/community/messages')
 def get_messages(req: Request, q: str=''):
-    u,c,m=require_community_member(req); locked=get_locked(c); settings=community_settings_row(c)
-    cutoff=int(time.time())-int(settings['disappearing_seconds'] or 0) if settings['disappearing_seconds'] else 0
-    if cutoff:
-        c.execute('DELETE FROM messages WHERE created<?',(cutoff,)); c.commit()
-    if q.strip(): rows=c.execute('SELECT * FROM messages WHERE created>=? AND text LIKE ? ORDER BY id ASC LIMIT 300',(cutoff if cutoff else 0,f'%{q.strip()}%')).fetchall()
-    else: rows=c.execute('SELECT * FROM messages WHERE created>=? ORDER BY id ASC LIMIT 300',(cutoff if cutoff else 0,)).fetchall()
+    u,c,m=require_community_member(req); locked=get_locked(c); settings=community_settings_row(c); now=int(time.time())
+    # Only messages explicitly marked temporary expire. Permanent community history is never removed here.
+    c.execute('DELETE FROM messages WHERE temporary=1 AND expires_at>0 AND expires_at<=?',(now,)); c.commit()
+    if q.strip():
+        rows=c.execute('SELECT * FROM messages WHERE (deleted=1 OR text LIKE ?) ORDER BY id ASC LIMIT 300',(f'%{q.strip()}%',)).fetchall()
+    else:
+        rows=c.execute('SELECT * FROM messages ORDER BY id ASC LIMIT 300').fetchall()
     out=[]
     for r in rows:
         reply=None
         if r['reply_to_id']:
             rr=c.execute('SELECT id,username,text FROM messages WHERE id=?',(r['reply_to_id'],)).fetchone()
             if rr: reply={'id':rr['id'],'username':rr['username'],'text':rr['text']}
-        out.append({'id':r['id'],'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'reply_to':reply,'edited':bool(r['edited']),'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M'),'created':r['created']})
-    c.close()
-    return {'locked':locked,'settings':settings,'messages':out}
+        reactions=c.execute('SELECT emoji,COUNT(*) n FROM message_reactions WHERE message_id=? GROUP BY emoji ORDER BY n DESC',(r['id'],)).fetchall()
+        viewers=c.execute('SELECT COUNT(*) n FROM message_views WHERE message_id=?',(r['id'],)).fetchone()['n']
+        remaining=max(0,int(r['expires_at'] or 0)-now) if r['temporary'] else 0
+        out.append({'id':r['id'],'username':r['username'],'pma_id':r['pma_id'],'text':r['text'],'media_data':r['media_data'],'media_type':r['media_type'],'reply_to':reply,'edited':bool(r['edited']),'deleted':bool(r['deleted']),'deleted_by':r['deleted_by'] or '', 'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%H:%M'),'created':r['created'],'temporary':bool(r['temporary']),'expires_at':r['expires_at'] or 0,'seconds_remaining':remaining,'reactions':[dict(x) for x in reactions],'views':viewers})
+    c.close(); return {'locked':locked,'settings':settings,'messages':out,'server_time':now}
 
 @app.post('/api/community/messages')
 def post_message(req: Request, x: Msg):
@@ -1034,20 +1115,152 @@ def post_message(req: Request, x: Msg):
     if not x.text.strip() and not x.media_data: c.close(); raise HTTPException(400,'Message cannot be empty.')
     reply_id=int(x.reply_to_id or 0)
     if reply_id and not c.execute('SELECT 1 FROM messages WHERE id=?',(reply_id,)).fetchone(): reply_id=0
-    now=int(time.time())
-    c.execute('INSERT INTO messages(username,pma_id,text,media_data,media_type,reply_to_id,edited,created) VALUES(?,?,?,?,?,?,?,?)',(u['username'],u['pma_id'],x.text.strip(),x.media_data,x.media_type,reply_id,0,now))
+    settings=community_settings_row(c); now=int(time.time())
+    temporary=bool(x.temporary and settings['temporary_enabled']) if u['role']!='admin' else bool(x.temporary and settings['temporary_enabled'])
+    expires=now+max(3600,int(settings['temporary_seconds'] or 86400)) if temporary else 0
+    c.execute('INSERT INTO messages(username,pma_id,text,media_data,media_type,reply_to_id,edited,created,temporary,expires_at,deleted,deleted_by,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(u['username'],u['pma_id'],x.text.strip(),x.media_data,x.media_type,reply_id,0,now,1 if temporary else 0,expires,0,'',0))
     record_activity(c,u['id'],'community_post',10)
     users=c.execute('SELECT username FROM users WHERE username<>?',(u['username'],)).fetchall()
     for r in users: push_notice(c,r['username'],'New community message',f"{u['username']} posted in the community.",'community')
-    c.commit(); c.close(); return {'ok':True}
+    c.commit(); c.close(); return {'ok':True,'temporary':temporary,'expires_at':expires}
+
+@app.patch('/api/community/messages/{message_id}')
+def edit_message(req: Request, message_id: int, x: CommunityMessageAction):
+    u,c,m=require_community_member(req); row=c.execute('SELECT * FROM messages WHERE id=?',(message_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404,'Message not found.')
+    if row['deleted']: c.close(); raise HTTPException(400,'Deleted messages cannot be edited.')
+    if row['username']!=u['username'] and u['role']!='admin': c.close(); raise HTTPException(403,'You can only edit your own message.')
+    text=x.text.strip()
+    if not text: c.close(); raise HTTPException(400,'Message cannot be empty.')
+    c.execute('UPDATE messages SET text=?,edited=1 WHERE id=?',(text,message_id)); c.commit(); c.close(); return {'ok':True}
 
 @app.delete('/api/community/messages/{message_id}')
 def delete_message(req: Request, message_id: int):
-    u,c,m=require_community_member(req)
-    row=c.execute('SELECT * FROM messages WHERE id=?',(message_id,)).fetchone()
+    u,c,m=require_community_member(req); row=c.execute('SELECT * FROM messages WHERE id=?',(message_id,)).fetchone()
     if not row: c.close(); raise HTTPException(404,'Message not found.')
     if row['username'] != u['username'] and u['role'] != 'admin': c.close(); raise HTTPException(403,'You can only delete your own message.')
-    c.execute('DELETE FROM messages WHERE id=?',(message_id,)); c.commit(); c.close(); return {'ok':True}
+    marker='This message was deleted by admin.' if u['role']=='admin' and row['username']!=u['username'] else 'This message was deleted.'
+    c.execute("UPDATE messages SET text=?,media_data='',media_type='',deleted=1,deleted_by=?,deleted_at=? WHERE id=?",(marker,u['username'],int(time.time()),message_id)); c.commit(); c.close(); return {'ok':True}
+
+@app.post('/api/community/messages/{message_id}/react')
+def react_community_message(req: Request, message_id: int, x: CommunityReaction):
+    u,c,m=require_community_member(req); row=c.execute('SELECT id FROM messages WHERE id=?',(message_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404,'Message not found.')
+    emoji=x.emoji.strip()[:8]
+    if not emoji: c.close(); raise HTTPException(400,'Reaction required.')
+    exists=c.execute('SELECT id FROM message_reactions WHERE message_id=? AND user_id=? AND emoji=?',(message_id,u['id'],emoji)).fetchone()
+    if exists: c.execute('DELETE FROM message_reactions WHERE id=?',(exists['id'],))
+    else: c.execute('INSERT INTO message_reactions(message_id,user_id,emoji,created) VALUES(?,?,?,?)',(message_id,u['id'],emoji,int(time.time())))
+    c.commit(); c.close(); return {'ok':True}
+
+@app.post('/api/community/messages/{message_id}/view')
+def view_community_message(req: Request, message_id: int):
+    u,c,m=require_community_member(req); row=c.execute('SELECT id FROM messages WHERE id=?',(message_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404,'Message not found.')
+    c.execute('INSERT OR REPLACE INTO message_views(message_id,user_id,viewed) VALUES(?,?,?)',(message_id,u['id'],int(time.time()))); c.commit(); c.close(); return {'ok':True}
+
+def _private_pair(a,b):
+    return (a,b) if a<b else (b,a)
+
+def _private_allowed(sender, receiver):
+    if sender['id']==receiver['id']: return False
+    # Members may never initiate a request or message to the administrator.
+    if sender['role']!='admin' and receiver['role']=='admin': return False
+    return True
+
+def _conversation_for(c,a,b,create=False):
+    ua,ub=_private_pair(a,b)
+    row=c.execute('SELECT * FROM private_conversations WHERE user_a=? AND user_b=?',(ua,ub)).fetchone()
+    if not row and create:
+        c.execute('INSERT OR IGNORE INTO private_conversations(user_a,user_b,created,last_message) VALUES(?,?,?,0)',(ua,ub,int(time.time())))
+        row=c.execute('SELECT * FROM private_conversations WHERE user_a=? AND user_b=?',(ua,ub)).fetchone()
+    return row
+
+@app.get('/api/members')
+def public_members(req: Request):
+    u=current(req); c=db()
+    rows=c.execute("SELECT id,username,full_name,pma_id,profile_picture,role,created FROM users WHERE role IN ('user','admin') AND id<>? ORDER BY CASE WHEN role='admin' THEN 0 ELSE 1 END, username COLLATE NOCASE",(u['id'],)).fetchall()
+    out=[dict(r) for r in rows]
+    for r in out: r['can_message']=bool(u['role']=='admin' or r['role']!='admin')
+    c.close(); return {'members':out}
+
+@app.get('/api/members/{user_id}')
+def public_member_profile(req: Request, user_id: int):
+    u=current(req); c=db(); r=c.execute('SELECT id,username,full_name,pma_id,profile_picture,role,created FROM users WHERE id=?',(user_id,)).fetchone()
+    if not r: c.close(); raise HTTPException(404,'Member not found.')
+    out=dict(r); out['can_message']=bool(u['role']=='admin' or r['role']!='admin')
+    reqrow=c.execute("SELECT status FROM message_requests WHERE sender_id=? AND receiver_id=? ORDER BY id DESC LIMIT 1",(u['id'],user_id)).fetchone()
+    reverse=c.execute("SELECT status FROM message_requests WHERE sender_id=? AND receiver_id=? ORDER BY id DESC LIMIT 1",(user_id,u['id'])).fetchone()
+    conv=_conversation_for(c,u['id'],user_id,False)
+    out['request_status']=reqrow['status'] if reqrow else ('accepted' if conv else '')
+    out['incoming_request']=reverse['status'] if reverse and reverse['status']=='pending' else ''
+    out['conversation_id']=conv['id'] if conv else None
+    c.close(); return out
+
+@app.get('/api/message-requests')
+def message_requests(req: Request):
+    u=current(req); c=db()
+    incoming=c.execute("SELECT r.id,r.status,r.created,u.id user_id,u.username,u.full_name,u.profile_picture,u.role FROM message_requests r JOIN users u ON u.id=r.sender_id WHERE r.receiver_id=? ORDER BY r.id DESC",(u['id'],)).fetchall()
+    outgoing=c.execute("SELECT r.id,r.status,r.created,u.id user_id,u.username,u.full_name,u.profile_picture,u.role FROM message_requests r JOIN users u ON u.id=r.receiver_id WHERE r.sender_id=? ORDER BY r.id DESC",(u['id'],)).fetchall()
+    c.close(); return {'incoming':[dict(r) for r in incoming],'outgoing':[dict(r) for r in outgoing]}
+
+@app.post('/api/message-requests')
+def create_message_request(req: Request, x: MessageRequestModel):
+    u=current(req); c=db(); target=c.execute('SELECT * FROM users WHERE id=?',(x.user_id,)).fetchone()
+    if not target: c.close(); raise HTTPException(404,'Member not found.')
+    if not _private_allowed(u,target): c.close(); raise HTTPException(403,'Members cannot message or request the administrator.')
+    if target['role']=='admin': c.close(); raise HTTPException(403,'Members cannot message or request the administrator.')
+    if _conversation_for(c,u['id'],target['id'],False): c.close(); return {'ok':True,'status':'accepted','conversation_id':_conversation_for(c,u['id'],target['id'],False)['id']}
+    existing=c.execute('SELECT * FROM message_requests WHERE sender_id=? AND receiver_id=?',(u['id'],target['id'])).fetchone()
+    if existing and existing['status']=='pending': c.close(); return {'ok':True,'status':'pending'}
+    now=int(time.time()); c.execute('INSERT OR REPLACE INTO message_requests(sender_id,receiver_id,status,created,responded) VALUES(?,?,?,?,0)',(u['id'],target['id'],'pending',now)); push_notice(c,target['username'],'New message request',f"{u['username']} wants to start a private conversation with you.",'community'); c.commit(); c.close(); return {'ok':True,'status':'pending'}
+
+@app.post('/api/message-requests/{request_id}')
+def decide_message_request(req: Request, request_id: int, x: RequestDecision):
+    u=current(req); action=x.action.lower().strip(); c=db(); r=c.execute('SELECT * FROM message_requests WHERE id=? AND receiver_id=?',(request_id,u['id'])).fetchone()
+    if not r: c.close(); raise HTTPException(404,'Message request not found.')
+    if r['status']!='pending': c.close(); return {'ok':True,'status':r['status']}
+    if action not in ('accept','decline'): c.close(); raise HTTPException(400,'Use accept or decline.')
+    now=int(time.time())
+    if action=='decline': c.execute('UPDATE message_requests SET status=?,responded=? WHERE id=?',('declined',now,request_id)); c.commit(); c.close(); return {'ok':True,'status':'declined'}
+    sender=c.execute('SELECT * FROM users WHERE id=?',(r['sender_id'],)).fetchone()
+    if not sender or sender['role']=='admin': c.close(); raise HTTPException(400,'Invalid member request.')
+    c.execute('UPDATE message_requests SET status=?,responded=? WHERE id=?',('accepted',now,request_id)); conv=_conversation_for(c,u['id'],sender['id'],True); push_notice(c,sender['username'],'Message request accepted',f"{u['username']} accepted your message request.",'community'); c.commit(); c.close(); return {'ok':True,'status':'accepted','conversation_id':conv['id']}
+
+@app.post('/api/private/start/{user_id}')
+def admin_start_private(req: Request, user_id: int):
+    u=current(req)
+    if u['role']!='admin': raise HTTPException(403,'Only the administrator can start a conversation without a request.')
+    c=db(); target=c.execute('SELECT * FROM users WHERE id=?',(user_id,)).fetchone()
+    if not target: c.close(); raise HTTPException(404,'Member not found.')
+    conv=_conversation_for(c,u['id'],target['id'],True); c.commit(); c.close(); return {'ok':True,'conversation_id':conv['id']}
+
+@app.get('/api/private/conversations')
+def private_conversations(req: Request):
+    u=current(req); c=db()
+    rows=c.execute("SELECT c.*, CASE WHEN c.user_a=? THEN ub.id ELSE ua.id END other_id, CASE WHEN c.user_a=? THEN ub.username ELSE ua.username END other_username, CASE WHEN c.user_a=? THEN ub.full_name ELSE ua.full_name END other_full_name, CASE WHEN c.user_a=? THEN ub.profile_picture ELSE ua.profile_picture END other_picture, CASE WHEN c.user_a=? THEN ub.role ELSE ua.role END other_role FROM private_conversations c JOIN users ua ON ua.id=c.user_a JOIN users ub ON ub.id=c.user_b WHERE c.user_a=? OR c.user_b=? ORDER BY c.last_message DESC,c.id DESC",(u['id'],u['id'],u['id'],u['id'],u['id'],u['id'],u['id'])).fetchall()
+    out=[]
+    for r in rows:
+        last=c.execute('SELECT text,created FROM private_messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1',(r['id'],)).fetchone()
+        d=dict(r); d['last_text']=last['text'] if last else ''; d['last_created']=last['created'] if last else 0; out.append(d)
+    c.close(); return {'conversations':out}
+
+@app.get('/api/private/conversations/{conversation_id}')
+def private_messages(req: Request, conversation_id: int):
+    u=current(req); c=db(); conv=c.execute('SELECT * FROM private_conversations WHERE id=? AND (user_a=? OR user_b=?)',(conversation_id,u['id'],u['id'])).fetchone()
+    if not conv: c.close(); raise HTTPException(404,'Conversation not found.')
+    other_id=conv['user_b'] if conv['user_a']==u['id'] else conv['user_a']; other=c.execute('SELECT id,username,full_name,profile_picture,role FROM users WHERE id=?',(other_id,)).fetchone()
+    rows=c.execute('SELECT * FROM private_messages WHERE conversation_id=? ORDER BY id ASC LIMIT 500',(conversation_id,)).fetchall(); c.close()
+    return {'conversation':dict(conv),'other':dict(other) if other else None,'messages':[dict(r) for r in rows]}
+
+@app.post('/api/private/conversations/{conversation_id}')
+def send_private_message(req: Request, conversation_id: int, x: PrivateMessage):
+    u=current(req); text=x.text.strip(); c=db(); conv=c.execute('SELECT * FROM private_conversations WHERE id=? AND (user_a=? OR user_b=?)',(conversation_id,u['id'],u['id'])).fetchone()
+    if not conv: c.close(); raise HTTPException(404,'Conversation not found.')
+    other_id=conv['user_b'] if conv['user_a']==u['id'] else conv['user_a']; other=c.execute('SELECT * FROM users WHERE id=?',(other_id,)).fetchone()
+    if not text: c.close(); raise HTTPException(400,'Message cannot be empty.')
+    if not _private_allowed(u,other): c.close(); raise HTTPException(403,'Members cannot message the administrator.')
+    now=int(time.time()); c.execute('INSERT INTO private_messages(conversation_id,sender_id,receiver_id,text,created,edited,deleted,deleted_by) VALUES(?,?,?,?,?,0,0,\'\')',(conversation_id,u['id'],other_id,text,now)); c.execute('UPDATE private_conversations SET last_message=? WHERE id=?',(now,conversation_id)); push_notice(c,other['username'],'New private message',f"{u['username']} sent you a private message.",'community'); c.commit(); c.close(); return {'ok':True}
 
 @app.post('/api/community/leave')
 def leave_community(req: Request):
@@ -1087,8 +1300,8 @@ def moderate_community(req: Request, x: CommunityModeration):
 def update_community_settings(req: Request, x: CommunitySettings):
     u=current(req)
     if u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    seconds=max(0,min(int(x.disappearing_seconds or 0),7*86400)); name=x.name.strip()[:80] or 'PMA Community'; bio=x.bio.strip()[:300] or 'A place for PMA members to learn, share and discuss the markets.'; now=int(time.time())
-    c=db(); c.execute('UPDATE community_settings SET name=?,bio=?,profile_picture=?,disappearing_seconds=?,updated_at=? WHERE id=1',(name,bio,x.profile_picture,seconds,now)); c.commit(); out=community_settings_row(c); c.close(); return {'ok':True,'settings':out}
+    seconds=86400; name=x.name.strip()[:80] or 'PMA Community'; bio=x.bio.strip()[:300] or 'A place for PMA members to learn, share and discuss the markets.'; now=int(time.time())
+    c=db(); c.execute('UPDATE community_settings SET name=?,bio=?,profile_picture=?,disappearing_seconds=?,temporary_enabled=?,temporary_seconds=?,updated_at=? WHERE id=1',(name,bio,x.profile_picture,seconds,1 if x.temporary_enabled else 0,seconds,now)); c.commit(); out=community_settings_row(c); c.close(); return {'ok':True,'settings':out}
 
 
 @app.post('/api/admin/community/toggle')
