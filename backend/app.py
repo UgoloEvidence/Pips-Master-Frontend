@@ -1048,7 +1048,7 @@ def history_all(req: Request, days: int=7):
 
 def community_settings_row(c):
     r=c.execute('SELECT * FROM community_settings WHERE id=1').fetchone()
-    return {'name':r['name'] if r else 'PMA Community','bio':r['bio'] if r and 'bio' in r.keys() else 'A place for PMA members to learn, share and discuss the markets.','profile_picture':r['profile_picture'] if r else '', 'disappearing_seconds':int(r['disappearing_seconds'] or 0) if r else 86400,'temporary_enabled':bool(r['temporary_enabled']) if r and 'temporary_enabled' in r.keys() else False,'temporary_seconds':int(r['temporary_seconds'] or 86400) if r and 'temporary_seconds' in r.keys() else 86400}
+    return {'name':r['name'] if r else 'PMA Community','bio':r['bio'] if r and 'bio' in r.keys() else 'A place for PMA members to learn, share and discuss the markets.','profile_picture':r['profile_picture'] if r else '', 'disappearing_seconds':int(r['disappearing_seconds']) if r and 'disappearing_seconds' in r.keys() else 86400,'temporary_enabled':bool(r['temporary_enabled']) if r and 'temporary_enabled' in r.keys() else False,'temporary_seconds':int(r['temporary_seconds']) if r and 'temporary_seconds' in r.keys() else 86400}
 
 def community_member(c,user_id):
     return c.execute('SELECT * FROM community_members WHERE user_id=?',(user_id,)).fetchone()
@@ -1300,7 +1300,9 @@ def moderate_community(req: Request, x: CommunityModeration):
 def update_community_settings(req: Request, x: CommunitySettings):
     u=current(req)
     if u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    seconds=86400; name=x.name.strip()[:80] or 'PMA Community'; bio=x.bio.strip()[:300] or 'A place for PMA members to learn, share and discuss the markets.'; now=int(time.time())
+    seconds=int(x.temporary_seconds or 0) if x.temporary_enabled else 0
+    if seconds not in (86400,604800): seconds=86400 if x.temporary_enabled else 0
+    name=x.name.strip()[:80] or 'PMA Community'; bio=x.bio.strip()[:300] or 'A place for PMA members to learn, share and discuss the markets.'; now=int(time.time())
     c=db(); c.execute('UPDATE community_settings SET name=?,bio=?,profile_picture=?,disappearing_seconds=?,temporary_enabled=?,temporary_seconds=?,updated_at=? WHERE id=1',(name,bio,x.profile_picture,seconds,1 if x.temporary_enabled else 0,seconds,now)); c.commit(); out=community_settings_row(c); c.close(); return {'ok':True,'settings':out}
 
 
