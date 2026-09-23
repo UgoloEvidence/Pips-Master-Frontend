@@ -1,9 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-import base64, hashlib, hmac, json, smtplib
+import base64, hashlib, hmac, json
 import os, random, secrets, sqlite3, time, threading
-import urllib.request
-from email.message import EmailMessage
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,15 +13,7 @@ from .market_data import fetch, analyze_setup, pip_size, backtest, trend_info, u
 ADMIN_EMAIL = os.getenv('PMA_ADMIN_EMAIL', 'ugoloevidence81@gmail.com').lower()
 ADMIN_USERNAME = os.getenv('PMA_ADMIN_USERNAME', 'PipsMaster')
 ADMIN_FULL_NAME = os.getenv('PMA_ADMIN_FULL_NAME', 'Ugolo Evidence')
-ADMIN_PASSWORD = os.getenv('PMA_ADMIN_PASSWORD', '')
-EMAIL_FROM = os.getenv('PMA_EMAIL_FROM', ADMIN_EMAIL)
-RESEND_API_KEY = os.getenv('RESEND_API_KEY', '')
-SMTP_HOST = os.getenv('SMTP_HOST', '')
-SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
-SMTP_USER = os.getenv('SMTP_USER', '')
-SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '')
-SMTP_TLS = os.getenv('SMTP_TLS', '1') != '0'
-EMAIL_VERIFY_TTL = int(os.getenv('PMA_EMAIL_VERIFY_TTL', '900'))
+ADMIN_PASSWORD = os.getenv('PMA_ADMIN_PASSWORD', 'march62010')
 TOKEN_SECRET = os.getenv('PMA_SECRET_KEY', '') or 'pma-dev-secret-change-this-in-render'
 TOKEN_TTL = int(os.getenv('PMA_TOKEN_TTL', str(60*60*24*30)))
 QUALIFICATION_HOURS = int(os.getenv('PMA_REFERRAL_QUALIFICATION_HOURS', '48'))
@@ -99,13 +89,6 @@ class Login(BaseModel):
     email: EmailStr
     password: str
 
-class EmailVerification(BaseModel):
-    email: EmailStr
-    code: str
-
-class EmailVerificationResend(BaseModel):
-    email: EmailStr
-
 
 class Msg(BaseModel):
     text: str = ''
@@ -163,7 +146,7 @@ def db():
         with _DB_INIT_LOCK:
             if not _DB_READY:
                 c.executescript('''
-                CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, full_name TEXT, email TEXT UNIQUE, password TEXT, pma_id TEXT UNIQUE, referral_code TEXT UNIQUE, referrer TEXT, role TEXT DEFAULT 'user', phone TEXT DEFAULT '', dob TEXT DEFAULT '', profile_picture TEXT DEFAULT '', created INTEGER, xp INTEGER DEFAULT 0, last_active INTEGER DEFAULT 0, login_count INTEGER DEFAULT 0, activity_count INTEGER DEFAULT 0, email_verified INTEGER DEFAULT 0, verification_code_hash TEXT DEFAULT '', verification_expires INTEGER DEFAULT 0, verification_attempts INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, full_name TEXT, email TEXT UNIQUE, password TEXT, pma_id TEXT UNIQUE, referral_code TEXT UNIQUE, referrer TEXT, role TEXT DEFAULT 'user', phone TEXT DEFAULT '', dob TEXT DEFAULT '', profile_picture TEXT DEFAULT '', created INTEGER, xp INTEGER DEFAULT 0, last_active INTEGER DEFAULT 0, login_count INTEGER DEFAULT 0, activity_count INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '', media_type TEXT DEFAULT '', reply_to_id INTEGER DEFAULT 0, edited INTEGER DEFAULT 0, created INTEGER);
                 CREATE TABLE IF NOT EXISTS community_members(user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member', warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0, note TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.', profile_picture TEXT DEFAULT '', disappearing_seconds INTEGER DEFAULT 604800, updated_at INTEGER DEFAULT 0);
@@ -187,11 +170,8 @@ def db():
                 if 'target_page' not in notif_existing: c.execute("ALTER TABLE notifications ADD COLUMN target_page TEXT DEFAULT ''")
                 if 'target_ref' not in notif_existing: c.execute("ALTER TABLE notifications ADD COLUMN target_ref TEXT DEFAULT ''")
                 existing={r['name'] for r in c.execute("PRAGMA table_info(users)").fetchall()}
-                migrations={'xp':'ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0','last_active':'ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0','login_count':'ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0','activity_count':'ALTER TABLE users ADD COLUMN activity_count INTEGER DEFAULT 0','email_verified':'ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 1','verification_code_hash':"ALTER TABLE users ADD COLUMN verification_code_hash TEXT DEFAULT ''",'verification_expires':'ALTER TABLE users ADD COLUMN verification_expires INTEGER DEFAULT 0','verification_attempts':'ALTER TABLE users ADD COLUMN verification_attempts INTEGER DEFAULT 0'}
-                for name,ddl in migrations.items():
+                for name,ddl in {'xp':'ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0','last_active':'ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0','login_count':'ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0','activity_count':'ALTER TABLE users ADD COLUMN activity_count INTEGER DEFAULT 0'}.items():
                     if name not in existing: c.execute(ddl)
-                # Existing accounts pre-date email verification, so don't lock them out during migration.
-                c.execute("UPDATE users SET email_verified=1 WHERE email_verified IS NULL OR (email_verified=0 AND COALESCE(verification_code_hash,'')='')")
                 now=int(time.time())
                 c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('history_retention_enabled','1')")
                 c.execute("INSERT OR IGNORE INTO community_settings(id,name,bio,profile_picture,disappearing_seconds,updated_at) VALUES(1,'PMA Community','A place for PMA members to learn, share and discuss the markets.','',604800,?)",(now,))
@@ -212,7 +192,7 @@ def db():
                         c.execute('UPDATE users SET username=?,full_name=?,role=? WHERE id=?',(ADMIN_USERNAME,ADMIN_FULL_NAME,'admin',ar['id']))
                         if not verify_password(ADMIN_PASSWORD,ar['password']): c.execute('UPDATE users SET password=? WHERE id=?',(hash_password(ADMIN_PASSWORD),ar['id']))
                     else:
-                        c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count,email_verified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(ADMIN_USERNAME,ADMIN_FULL_NAME,ADMIN_EMAIL,hash_password(ADMIN_PASSWORD),'PMA-ADMIN001','PMAADMIN001','', 'admin',now,0,now,0,1))
+                        c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(ADMIN_USERNAME,ADMIN_FULL_NAME,ADMIN_EMAIL,hash_password(ADMIN_PASSWORD),'PMA-ADMIN001','PMAADMIN001','', 'admin',now,0,now,0,1))
                 c.commit(); _DB_READY=True
     return c
 
@@ -224,7 +204,7 @@ def user_out(row):
     return {
         'username': row['username'], 'full_name': row['full_name'], 'email': row['email'],
         'pma_id': row['pma_id'], 'referral_code': row['referral_code'], 'role': row['role'],
-        'phone': row['phone'] or '', 'dob': row['dob'] or '', 'profile_picture': row['profile_picture'] or '', 'email_verified': bool(row['email_verified']) if 'email_verified' in row.keys() else True,
+        'phone': row['phone'] or '', 'dob': row['dob'] or '', 'profile_picture': row['profile_picture'] or '',
     }
 
 
@@ -380,74 +360,6 @@ def health():
     return {'ok':True,'service':'pma-api','time':utc_iso()}
 
 
-def _verification_hash(email, code):
-    return hashlib.sha256((str(email).lower().strip() + ':' + str(code) + ':' + TOKEN_SECRET).encode('utf-8')).hexdigest()
-
-
-def _send_verification_email(email, code):
-    subject = 'Verify your Pips Master Academy email'
-    body = f"Your Pips Master Academy verification code is {code}. It expires in 15 minutes. If you did not create this account, you can ignore this email."
-    if RESEND_API_KEY:
-        payload = json.dumps({'from': EMAIL_FROM, 'to': [str(email)], 'subject': subject, 'text': body}).encode('utf-8')
-        req = urllib.request.Request('https://api.resend.com/emails', data=payload, headers={'Authorization': f'Bearer {RESEND_API_KEY}', 'Content-Type': 'application/json', 'User-Agent': 'PMA/1.0'})
-        with urllib.request.urlopen(req, timeout=8) as response:
-            if response.status >= 300: raise RuntimeError('Email provider rejected the message')
-        return
-    if SMTP_HOST and SMTP_USER and SMTP_PASSWORD:
-        msg=EmailMessage(); msg['Subject']=subject; msg['From']=EMAIL_FROM; msg['To']=str(email); msg.set_content(body)
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=8) as server:
-            if SMTP_TLS: server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD); server.send_message(msg)
-        return
-    raise RuntimeError('Email delivery is not configured. Set RESEND_API_KEY or SMTP_HOST/SMTP_USER/SMTP_PASSWORD on the backend.')
-
-
-def _email_provider_configured():
-    return bool(RESEND_API_KEY or (SMTP_HOST and SMTP_USER and SMTP_PASSWORD))
-
-def _email_provider_name():
-    if RESEND_API_KEY: return 'Resend'
-    if SMTP_HOST and SMTP_USER and SMTP_PASSWORD: return 'SMTP'
-    return 'Not configured'
-
-
-def _issue_verification(c, row):
-    code=f'{secrets.randbelow(1000000):06d}'; expires=int(time.time())+EMAIL_VERIFY_TTL
-    c.execute('UPDATE users SET verification_code_hash=?,verification_expires=?,verification_attempts=0 WHERE id=?',(_verification_hash(row['email'],code),expires,row['id']))
-    _send_verification_email(row['email'],code)
-    return expires
-
-
-@app.post('/api/auth/verify-email')
-def verify_email(x: EmailVerification):
-    email=str(x.email).lower().strip(); code=''.join(ch for ch in str(x.code) if ch.isdigit())
-    if len(code)!=6: raise HTTPException(400,'Enter the 6-digit verification code.')
-    c=db(); row=c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(email,)).fetchone()
-    if not row: c.close(); raise HTTPException(404,'No account was found for that email.')
-    if int(row['verification_attempts'] or 0)>=5: c.close(); raise HTTPException(429,'Too many incorrect attempts. Request a new code.')
-    if int(row['verification_expires'] or 0)<int(time.time()): c.close(); raise HTTPException(400,'That verification code has expired. Request a new code.')
-    if not hmac.compare_digest(_verification_hash(email,code),row['verification_code_hash'] or ''):
-        c.execute('UPDATE users SET verification_attempts=COALESCE(verification_attempts,0)+1 WHERE id=?',(row['id'],)); c.commit(); c.close(); raise HTTPException(400,'Incorrect verification code.')
-    now=int(time.time())
-    c.execute("UPDATE users SET email_verified=1,verification_code_hash='',verification_expires=0,verification_attempts=0,last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?",(now,row['id']))
-    c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login_verified',now))
-    push_notice(c,row['username'],'Email verified','Your email was verified and your PMA session was signed in.','security')
-    c.commit()
-    fresh=c.execute('SELECT * FROM users WHERE id=?',(row['id'],)).fetchone()
-    c.close()
-    return {'ok':True,'verified':True,'message':'Email verified successfully. You are now signed in.','user':user_out(fresh),'token':make_token(fresh['id'])}
-
-
-@app.post('/api/auth/resend-verification')
-def resend_verification(x: EmailVerificationResend):
-    email=str(x.email).lower().strip(); c=db(); row=c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(email,)).fetchone()
-    if not row: c.close(); raise HTTPException(404,'No account was found for that email.')
-    if int(row['email_verified'] or 0): c.close(); return {'ok':True,'verified':True,'message':'Email is already verified.'}
-    try: _issue_verification(c,row); c.commit(); c.close()
-    except Exception as ex: c.rollback(); c.close(); raise HTTPException(503,str(ex))
-    return {'ok':True,'message':'A new verification code has been sent.'}
-
-
 @app.post('/api/auth/signup')
 def signup(x: Signup):
     if x.password != x.confirm_password: raise HTTPException(400,'Passwords do not match.')
@@ -463,8 +375,8 @@ def signup(x: Signup):
     role = 'admin' if ADMIN_PASSWORD and str(x.email).lower() == ADMIN_EMAIL.lower() and x.password == ADMIN_PASSWORD else 'user'
     now = int(time.time())
     referrer = resolve_referrer(c, x.referral)
-    c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count,email_verified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-              (x.username.strip(),x.full_name.strip(),str(x.email).lower(),hash_password(x.password),pma,pma.replace('-',''),referrer['username'] if referrer else '',role,now,0,now,0,1,0))
+    c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+              (x.username.strip(),x.full_name.strip(),str(x.email).lower(),hash_password(x.password),pma,pma.replace('-',''),referrer['username'] if referrer else '',role,now,0,now,0,1))
     uid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
     c.execute('INSERT OR REPLACE INTO community_members(user_id,status,role,joined_at,updated_at,note) VALUES(?,?,?,?,?,?)',(uid,'approved' if role=='admin' else 'pending','admin' if role=='admin' else 'member',now if role=='admin' else 0,now,'Approved automatically for administrator' if role=='admin' else 'Awaiting administrator approval'))
     c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(uid,datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'signup',now))
@@ -473,44 +385,22 @@ def signup(x: Signup):
                   (referrer['id'],uid,month_key(now),'pending',now,now + QUALIFICATION_HOURS*3600))
         push_notice(c, referrer['username'], 'New referral', f"{x.username} joined through your referral link. It is pending qualification.", 'referral')
     row = c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
-    try: _issue_verification(c,row)
-    except Exception as ex:
-        c.rollback(); c.close(); raise HTTPException(503,str(ex))
-    push_notice(c,row['username'],'Verify your email','A verification code was sent to your email address.','security')
+    push_notice(c,row['username'],'Welcome to Pips Master Academy','Your account was created successfully.','account')
     c.commit(); c.close()
-    return {'user':user_out(row),'verification_required':True,'message':'Account created. Check your email for the 6-digit verification code.'}
-
-
-@app.get('/api/auth/email-status')
-def auth_email_status(req: Request):
-    # Safe diagnostic endpoint: exposes configuration state, never credentials.
-    return {'configured': _email_provider_configured(), 'provider': _email_provider_name(), 'from_configured': bool(EMAIL_FROM), 'verification_required_on_login': False}
+    token = make_token(uid)
+    return {'user':user_out(row),'token':token}
 
 
 @app.post('/api/auth/login')
 def login(x: Login):
-    email=str(x.email).lower().strip()
-    c = db(); row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(email,)).fetchone()
-    if not row or not verify_password(x.password,row['password']):
-        c.close(); raise HTTPException(401,'Email or password is incorrect.')
-
-    # If the configured administrator credentials match, repair the role on login
-    # instead of forcing the administrator to create a second account.
-    if ADMIN_PASSWORD and email == ADMIN_EMAIL and x.password == ADMIN_PASSWORD and row['role'] != 'admin':
-        c.execute('UPDATE users SET role=?,username=?,full_name=? WHERE id=?',(
-            'admin', ADMIN_USERNAME, ADMIN_FULL_NAME, row['id']))
-        c.commit(); row=c.execute('SELECT * FROM users WHERE id=?',(row['id'],)).fetchone()
-
-    # Login is password-based. Do not block an existing account on email delivery.
-    # Email verification remains available for newly created accounts, but the
-    # explicit login flow no longer requires a six-digit code.
-    now=int(time.time())
-    c.execute("UPDATE users SET email_verified=1,last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?",(now,row['id']))
+    c = db(); row = c.execute('SELECT * FROM users WHERE lower(email)=lower(?)',(str(x.email),)).fetchone()
+    if not row or not verify_password(x.password,row['password']): c.close(); raise HTTPException(401,'Email or password is incorrect.')
+    now = int(time.time())
+    c.execute('UPDATE users SET last_active=?,login_count=COALESCE(login_count,0)+1,activity_count=COALESCE(activity_count,0)+1 WHERE id=?',(now,row['id']))
     c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(row['id'],datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'login',now))
-    c.commit()
-    fresh=c.execute('SELECT * FROM users WHERE id=?',(row['id'],)).fetchone()
-    c.close()
-    return {'ok':True,'logged_in':True,'message':'Signed in successfully.','user':user_out(fresh),'token':make_token(fresh['id'])}
+    push_notice(c,row['username'],'New login','Your account was signed in successfully.','security'); c.commit(); c.close()
+    token=make_token(row['id'])
+    return {'user':user_out(row),'token':token}
 
 
 @app.post('/api/auth/logout')
@@ -979,12 +869,7 @@ def history_all(req: Request, days: int=7):
         c.commit()
     rows=c.execute('SELECT * FROM trade_history WHERE user_id=? ORDER BY closed_at DESC LIMIT 300',(u['id'],)).fetchall()
     sig=c.execute('SELECT * FROM signal_history WHERE (user_id=? OR user_id IS NULL) ORDER BY created DESC LIMIT 300',(u['id'],)).fetchall()
-    trade_list=[dict(r) for r in rows]
-    wins=sum(1 for r in trade_list if str(r.get('outcome','')).lower() in {'take_profit','close_in_profit'})
-    losses=sum(1 for r in trade_list if str(r.get('outcome','')).lower() in {'stop_loss','close_in_loss'})
-    decided=wins+losses; total=len(trade_list)
-    win_rate=round(wins/decided*100,1) if decided else 0.0; loss_rate=round(losses/decided*100,1) if decided else 0.0
-    c.close(); return {'enabled':enabled,'days':7,'trades':trade_list,'signals':[dict(r) for r in sig],'summary':{'total_trades':total,'profitable_trades':wins,'losing_trades':losses,'undecided_trades':max(0,total-decided),'profit_rate':win_rate,'loss_rate':loss_rate,'total_profit_trades':wins,'total_loss_trades':losses,'net_outcome':wins-losses}}
+    c.close(); return {'enabled':enabled,'days':7,'trades':[dict(r) for r in rows],'signals':[dict(r) for r in sig]}
 
 def community_settings_row(c):
     r=c.execute('SELECT * FROM community_settings WHERE id=1').fetchone()
