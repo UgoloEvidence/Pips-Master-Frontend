@@ -1,1 +1,7 @@
-PMA mature color revision: removed purple/plum tones entirely. The interface now uses a restrained charcoal, graphite, warm stone, muted sage, and copper palette. Cards have controlled tonal variation rather than a single background. Light mode uses ivory, stone, sage, copper, and muted gold. BUY/SELL/NEUTRAL trading states remain distinctly green/red/gold.
+PMA visual update
+- Removed the purple/violet visual system.
+- Added a persistent 5-image background carousel using the supplied AI trader image plus four existing market/analytics image sources.
+- Carousel changes every 10 seconds with a 1-second cross-fade and continues across SPA section navigation without restarting.
+- Dark theme uses restrained charcoal/graphite/slate/copper/sage accents.
+- Light theme uses clean white/soft-blue/graphite/copper accents.
+- BUY remains green, SELL red, NEUTRAL amber.
