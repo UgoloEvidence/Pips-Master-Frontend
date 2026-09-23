@@ -1,8 +1,1 @@
-PMA Mature Color Update
-
-Palette:
-- Dark mode: charcoal/plum base, warm slate-plum surfaces, copper accent, sage/gold secondary accents.
-- Light mode: warm ivory/taupe base, plum surfaces/text, copper accent, sage/gold secondary accents.
-- Trading states remain distinct: BUY green, SELL red, NEUTRAL gold.
-
-The update is intentionally restrained to a small mature palette rather than many unrelated colors.
+PMA mature color revision: removed purple/plum tones entirely. The interface now uses a restrained charcoal, graphite, warm stone, muted sage, and copper palette. Cards have controlled tonal variation rather than a single background. Light mode uses ivory, stone, sage, copper, and muted gold. BUY/SELL/NEUTRAL trading states remain distinctly green/red/gold.
