@@ -136,6 +136,7 @@ class CommunitySettings(BaseModel):
 class Profile(BaseModel):
     full_name: str
     username: str
+    email: str = ''
     phone: str = ''
     dob: str = ''
     profile_picture: str = ''
@@ -539,14 +540,21 @@ def get_profile(req: Request):
 @app.put('/api/auth/profile')
 def update_profile(req: Request, x: Profile):
     u=current(req); c=db()
-    if c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?) AND id<>?',(x.username,u['id'])).fetchone():
+    new_username=x.username.strip()
+    new_email=(x.email or u['email']).strip().lower()
+    if not new_username:
+        c.close(); raise HTTPException(400,'Username cannot be empty.')
+    if not new_email:
+        c.close(); raise HTTPException(400,'Email cannot be empty.')
+    if c.execute('SELECT 1 FROM users WHERE lower(username)=lower(?) AND id<>?',(new_username,u['id'])).fetchone():
         c.close(); raise HTTPException(400,'That username is already in use.')
-    old_username = u['username']
-    new_username = x.username.strip()
-    c.execute('UPDATE users SET full_name=?,username=?,phone=?,dob=?,profile_picture=?,last_active=? WHERE id=?',(x.full_name.strip(),new_username,x.phone.strip(),x.dob,x.profile_picture or '',int(time.time()),u['id']))
+    if c.execute('SELECT 1 FROM users WHERE lower(email)=lower(?) AND id<>?',(new_email,u['id'])).fetchone():
+        c.close(); raise HTTPException(400,'That email is already in use.')
+    old_username=u['username']
+    c.execute('UPDATE users SET full_name=?,username=?,email=?,phone=?,dob=?,profile_picture=?,last_active=? WHERE id=?',(x.full_name.strip(),new_username,new_email,x.phone.strip(),x.dob,x.profile_picture or '',int(time.time()),u['id']))
     c.execute('UPDATE notifications SET username=? WHERE username=?',(new_username,old_username))
     c.execute('UPDATE referrals SET reason=reason WHERE referred_id=?',(u['id'],))
-    push_notice(c,x.username.strip(),'Profile saved','Your profile changes were saved successfully.','account'); c.commit()
+    push_notice(c,new_username,'Profile saved','Your profile changes were saved successfully.','account'); c.commit()
     row=c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone(); c.close(); return {'user':user_out(row)}
 
 

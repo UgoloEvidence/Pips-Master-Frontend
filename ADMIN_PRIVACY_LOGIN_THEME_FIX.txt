@@ -1,0 +1,20 @@
+PMA targeted fix — 2026-09-23
+
+1. Admin profile privacy
+- Admin personal fields in My Profile are hidden by default with eye controls.
+- Full Name, Username, Email, Phone, Date of Birth and PMA User ID can be revealed/edited with the eye control.
+- Admin header shows “Administrator” instead of the admin username.
+
+2. Admin profile editing
+- Email is now editable.
+- Backend validates username/email uniqueness and saves the updated email.
+- Existing non-admin profile behavior remains unchanged.
+
+3. Login/theme/reload resilience
+- Login and session-profile requests now allow up to 45 seconds for a sleeping/waking Render backend.
+- Login retries increased.
+- Session restore retries increased.
+- A transient /auth/profile failure no longer immediately sends a previously logged-in user to the Welcome page when a cached local session exists; the app opens and silently re-verifies the session. Invalid/forbidden sessions are still cleared.
+- Theme selection remains stored in localStorage and is not cleared by theme changes/reloads.
+
+No live production API test was possible from this environment; static JS/Python checks and archive integrity are required before deployment.
