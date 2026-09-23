@@ -16,6 +16,9 @@ ADMIN_FULL_NAME = os.getenv('PMA_ADMIN_FULL_NAME', 'Ugolo Evidence')
 ADMIN_PASSWORD = os.getenv('PMA_ADMIN_PASSWORD', 'march62010')
 TOKEN_SECRET = os.getenv('PMA_SECRET_KEY', '') or 'pma-dev-secret-change-this-in-render'
 TOKEN_TTL = int(os.getenv('PMA_TOKEN_TTL', str(60*60*24*30)))
+VAPID_PUBLIC_KEY = os.getenv('PMA_VAPID_PUBLIC_KEY', 'BDuFoIUEKTsHTSl5SXZEIWNaYK317R0F5gnOLgD0iqXHXCsP49bo7mLfIDFG54DPvpEOGO4Qo4HFudz4iRnGCBI')
+VAPID_PRIVATE_KEY = os.getenv('PMA_VAPID_PRIVATE_KEY', '')
+VAPID_SUBJECT = os.getenv('PMA_VAPID_SUBJECT', 'mailto:admin@example.com')
 QUALIFICATION_HOURS = int(os.getenv('PMA_REFERRAL_QUALIFICATION_HOURS', '48'))
 DB = os.getenv('PMA_DB', 'pma.db')
 sessions = {}
@@ -150,7 +153,7 @@ def db():
                 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '', media_type TEXT DEFAULT '', reply_to_id INTEGER DEFAULT 0, edited INTEGER DEFAULT 0, created INTEGER);
                 CREATE TABLE IF NOT EXISTS community_members(user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member', warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0, note TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.', profile_picture TEXT DEFAULT '', disappearing_seconds INTEGER DEFAULT 604800, updated_at INTEGER DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0, target_page TEXT DEFAULT '', target_ref TEXT DEFAULT '');
+                CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0, target_page TEXT DEFAULT '', target_ref TEXT DEFAULT ''); CREATE TABLE IF NOT EXISTS push_subscriptions(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created INTEGER DEFAULT 0, updated INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE IF NOT EXISTS referrals(id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, referred_id INTEGER NOT NULL, challenge_month TEXT NOT NULL, status TEXT DEFAULT 'pending', created INTEGER NOT NULL, qualification_due INTEGER NOT NULL, qualified_at INTEGER, flagged INTEGER DEFAULT 0, reason TEXT DEFAULT '', UNIQUE(referrer_id,referred_id));
                 CREATE TABLE IF NOT EXISTS lesson_progress(user_id INTEGER NOT NULL, lesson_id TEXT NOT NULL, completed_at INTEGER NOT NULL, PRIMARY KEY(user_id,lesson_id));
@@ -309,6 +312,25 @@ def push_notice(c, username, title, text, typ='info', target_page=''):
     page = target_page or notification_target(typ)
     c.execute('INSERT INTO notifications(username,title,text,type,created,read,target_page,target_ref) VALUES(?,?,?,?,?,?,?,?)',
               (username,title,text,typ,int(time.time()),0,page,''))
+    # Also deliver the notification as a native browser push notification when the
+    # account has an active Web Push subscription. The app continues to work normally
+    # if push credentials are not configured.
+    if webpush and VAPID_PRIVATE_KEY:
+        row = c.execute('SELECT id FROM users WHERE username=?',(username,)).fetchone()
+        if row:
+            subs = c.execute('SELECT id,endpoint,p256dh,auth FROM push_subscriptions WHERE user_id=?',(row['id'],)).fetchall()
+            payload = json.dumps({'title': title, 'body': text, 'type': typ, 'target_page': page})
+            for sub in subs:
+                try:
+                    webpush(subscription_info={'endpoint':sub['endpoint'],'keys':{'p256dh':sub['p256dh'],'auth':sub['auth']}},
+                            data=payload,
+                            vapid_private_key=VAPID_PRIVATE_KEY,
+                            vapid_claims={'sub':VAPID_SUBJECT})
+                except Exception as exc:
+                    msg = str(exc)
+                    if '404' in msg or '410' in msg:
+                        c.execute('DELETE FROM push_subscriptions WHERE id=?',(sub['id'],))
+
 
 
 def get_locked(c):
@@ -435,6 +457,34 @@ def change_password(req: Request, x: PasswordChange):
     c=db(); c.execute('UPDATE users SET password=? WHERE id=?',(hash_password(x.password),u['id'])); push_notice(c,u['username'],'Password updated','Your password was updated successfully.','security'); c.commit(); c.close(); return {'ok':True}
 
 
+class PushSubscription(BaseModel):
+    endpoint: str
+    keys: dict
+
+@app.get('/api/push/public-key')
+def push_public_key():
+    return {'public_key': VAPID_PUBLIC_KEY}
+
+@app.post('/api/push/subscribe')
+def push_subscribe(req: Request, x: PushSubscription):
+    u=current(req)
+    keys=x.keys or {}
+    if not x.endpoint or not keys.get('p256dh') or not keys.get('auth'):
+        raise HTTPException(400,'Invalid push subscription.')
+    c=db()
+    now=int(time.time())
+    c.execute('INSERT INTO push_subscriptions(user_id,endpoint,p256dh,auth,created,updated) VALUES(?,?,?,?,?,?) '
+              'ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,updated=excluded.updated',
+              (u['id'],x.endpoint,keys['p256dh'],keys['auth'],now,now))
+    c.commit(); c.close()
+    return {'ok':True}
+
+@app.delete('/api/push/subscribe')
+def push_unsubscribe(req: Request, x: PushSubscription):
+    u=current(req)
+    c=db(); c.execute('DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?',(u['id'],x.endpoint)); c.commit(); c.close()
+    return {'ok':True}
+
 @app.get('/api/notifications')
 def notifications(req: Request):
     u=current(req); c=db(); rows=c.execute('SELECT * FROM notifications WHERE username=? ORDER BY id DESC LIMIT 200',(u['username'],)).fetchall(); c.close()
@@ -458,6 +508,10 @@ def notifications_read_one(req: Request, x: NotificationRead):
 @app.post('/api/notifications/read')
 def notifications_read(req: Request):
     u=current(req); c=db(); c.execute('UPDATE notifications SET read=1 WHERE username=?',(u['username'],)); c.commit(); c.close(); return {'ok':True}
+
+@app.delete('/api/notifications/history')
+def notifications_delete_history(req: Request):
+    u=current(req); c=db(); c.execute('DELETE FROM notifications WHERE username=?',(u['username'],)); c.commit(); c.close(); return {'ok':True}
 
 
 class Feedback(BaseModel):

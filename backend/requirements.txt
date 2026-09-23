@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 bcrypt>=4.1,<5
 email-validator
+pywebpush>=2.0.0,<3
