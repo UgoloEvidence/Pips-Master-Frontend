@@ -595,11 +595,15 @@ def push_unsubscribe(req: Request, x: PushSubscription):
 
 @app.get('/api/notifications')
 def notifications(req: Request):
-    u=current(req); c=db()
+    u=current(req); c=db(); now=int(time.time()); retention_cutoff=now-14*86400
+    # Enforce the two-week retention policy on the server.
+    c.execute('DELETE FROM notifications WHERE username=? AND created<?',(u['username'],retention_cutoff))
     cutoff_row=c.execute("SELECT value FROM settings WHERE key=?",(f'notification_clear_before:{u["id"]}',)).fetchone()
     cutoff=int(cutoff_row['value']) if cutoff_row and str(cutoff_row['value']).isdigit() else 0
-    rows=c.execute('SELECT * FROM notifications WHERE username=? AND created>? ORDER BY id DESC LIMIT 200',(u['username'],cutoff)).fetchall(); c.close()
-    return {'notifications':[{'id':r['id'],'title':r['title'],'text':r['text'],'type':r['type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'read':bool(r['read']),'target_page':r['target_page'] or notification_target(r['type']),'target_ref':r['target_ref'] or ''} for r in rows]}
+    effective_cutoff=max(cutoff,retention_cutoff)
+    c.commit()
+    rows=c.execute('SELECT * FROM notifications WHERE username=? AND created>? ORDER BY id DESC LIMIT 200',(u['username'],effective_cutoff)).fetchall(); c.close()
+    return {'notifications':[{'id':r['id'],'title':r['title'],'text':r['text'],'type':r['type'],'created':int(r['created']),'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'read':bool(r['read']),'target_page':r['target_page'] or notification_target(r['type']),'target_ref':r['target_ref'] or ''} for r in rows]}
 
 
 class NotificationRead(BaseModel):
@@ -663,9 +667,22 @@ def submit_feedback(req: Request, x: Feedback):
               (u['id'],u['username'],category,rating,message,now,'new'))
     record_activity(c,u['id'],'feedback_submit',rating*5)
     push_notice(c,u['username'],'Feedback received','Thanks — your feedback was saved to your PMA account.','feedback')
+    # Notify every administrator so submitted member feedback is visible to the admin.
+    admins=c.execute("SELECT username FROM users WHERE role='admin'").fetchall()
+    for a in admins:
+        push_notice(c,a['username'],'New member feedback',f"{u['username']} submitted {rating}★ feedback in {category}.",'feedback','profile')
     c.commit(); c.close()
     return {'ok':True}
 
+
+@app.get('/api/admin/feedback')
+def admin_feedback(req: Request, limit: int = 100):
+    u=current(req)
+    if u['role']!='admin': raise HTTPException(403,'Admin access required.')
+    c=db(); rows=c.execute('''SELECT f.id,f.username,f.category,f.rating,f.message,f.created,f.status,
+        u.full_name,u.email FROM feedback f JOIN users u ON u.id=f.user_id
+        ORDER BY f.id DESC LIMIT ?''',(max(1,min(int(limit or 100),300)),)).fetchall(); c.close()
+    return {'feedback':[{'id':r['id'],'username':r['username'],'full_name':r['full_name'],'email':r['email'],'category':r['category'],'rating':r['rating'],'message':r['message'],'created':int(r['created']),'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'status':r['status']} for r in rows]}
 
 @app.get('/api/feedback')
 def my_feedback(req: Request):
