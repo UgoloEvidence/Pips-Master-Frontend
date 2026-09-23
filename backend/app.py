@@ -615,13 +615,16 @@ def notifications_read(req: Request):
 @app.delete('/api/notifications/history')
 def notifications_delete_history(req: Request):
     u=current(req); now=int(time.time()); c=db()
-    c.execute('DELETE FROM notifications WHERE username=?',(u['username'],))
+    cur=c.execute('DELETE FROM notifications WHERE username=?',(u['username'],))
+    deleted=cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
     # Keep a server-side tombstone so a stale client/cache cannot immediately repopulate
     # notifications that the user explicitly deleted. New notifications created after this
     # timestamp are still delivered normally.
     c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(f'notification_clear_before:{u["id"]}',str(now)))
-    deleted=c.rowcount if c.rowcount is not None else 0
-    c.commit(); c.close(); return {'ok':True,'deleted':deleted,'cleared_at':now}
+    c.commit()
+    remaining=c.execute('SELECT COUNT(*) AS n FROM notifications WHERE username=?',(u['username'],)).fetchone()['n']
+    c.close()
+    return {'ok':True,'deleted':deleted,'remaining':remaining,'cleared_at':now}
 
 
 

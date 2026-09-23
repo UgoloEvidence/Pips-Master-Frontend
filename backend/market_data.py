@@ -166,6 +166,25 @@ TV_TICKER_PREFIXES = {
     'Indices': ['CAPITALCOM:', 'TVC:'],
     'Commodities': ['TVC:', 'OANDA:'],
 }
+# TradingView uses provider-specific canonical symbols for non-Forex markets.
+# Keep the app's friendly symbols in the UI, but query the real provider symbols.
+TV_SYMBOL_ALIASES = {
+    'US30': ['US30USD', 'US30'],
+    'NAS100': ['NAS100USD', 'NAS100'],
+    'SPX500': ['US500', 'SPX500'],
+    'GER40': ['DE40EUR', 'GER40'],
+    'UK100': ['UK100GBP', 'UK100'],
+    'FRA40': ['FR40EUR', 'FRA40'],
+    'JP225': ['JPN225USD', 'JP225'],
+    'XAUUSD': ['XAUUSD'],
+    'XAGUSD': ['XAGUSD'],
+    'XPTUSD': ['XPTUSD'],
+    'XPDUSD': ['XPDUSD'],
+    'USOIL': ['USOIL'],
+    'UKOIL': ['UKOIL'],
+    'NATGAS': ['NATURALGAS', 'NATGAS'],
+    'COPPER': ['COPPER'],
+}
 
 
 def _tv_field(base, tf):
@@ -175,9 +194,11 @@ def _tv_field(base, tf):
 
 def _tv_tickers(symbol, market='Forex'):
     s = norm_symbol(symbol)
+    candidates = TV_SYMBOL_ALIASES.get(s, [s])
+    prefixes = TV_TICKER_PREFIXES.get(market, ['OANDA:', 'FX_IDC:'])
     if market == 'Crypto' and s.endswith('USD'):
-        return [p + s for p in TV_TICKER_PREFIXES['Crypto']]
-    return [p + s for p in TV_TICKER_PREFIXES.get(market, ['OANDA:', 'FX_IDC:'])]
+        return [p + c for c in candidates for p in prefixes]
+    return [p + c for c in candidates for p in prefixes]
 
 
 
@@ -248,10 +269,11 @@ def _tv_scan_many(symbols, market='Forex', timeframes=None):
               ('https://scanner.tradingview.com/crypto/scan' if market=='Crypto' else
                'https://scanner.tradingview.com/global/scan'))
     tickers=[]
+    ticker_to_symbol={}
     for sym in symbols:
-        prefixes=TV_TICKER_PREFIXES.get(market,['OANDA:','FX_IDC:'])
-        for pref in prefixes:
-            tickers.append(pref+sym)
+        for ticker in _tv_tickers(sym, market):
+            tickers.append(ticker)
+            ticker_to_symbol[ticker.upper()] = sym
     payload={'symbols':{'tickers':tickers,'query':{'types':[]}},'columns':columns,'range':[0,len(tickers)],'options':{'lang':'en'}}
     req=urllib.request.Request(endpoint,data=json.dumps(payload).encode('utf-8'),headers={
         'Content-Type':'application/json','Accept':'application/json','User-Agent':'Mozilla/5.0 PMA/5.0',
@@ -263,10 +285,12 @@ def _tv_scan_many(symbols, market='Forex', timeframes=None):
     wanted=set(symbols)
     for row in rows:
         ticker=str(row.get('s') or '')
-        sym=None
-        for candidate in symbols:
-            if ticker.upper().endswith(':'+candidate) or ticker.upper()==candidate:
-                sym=candidate; break
+        sym=ticker_to_symbol.get(ticker.upper())
+        if not sym:
+            for candidate in symbols:
+                aliases=TV_SYMBOL_ALIASES.get(candidate,[candidate])
+                if any(ticker.upper().endswith(':'+a) or ticker.upper()==a for a in aliases):
+                    sym=candidate; break
         if not sym or sym in out: continue
         vals=row.get('d') or []
         if len(vals)!=len(columns): continue
