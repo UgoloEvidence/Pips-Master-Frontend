@@ -642,16 +642,30 @@ def submit_feedback(req: Request, x: Feedback):
         raise HTTPException(400,'Please write your feedback before sending.')
     rating=max(1,min(5,int(x.rating)))
     category=(x.category or 'General').strip()[:40]
-    c=db(); now=int(time.time())
-    duplicate=c.execute('SELECT 1 FROM feedback WHERE user_id=? AND category=? AND rating=? AND message=? LIMIT 1',(u['id'],category,rating,message)).fetchone()
-    if duplicate:
-        c.close(); raise HTTPException(409,'You have already submitted this exact feedback.')
-    c.execute('INSERT INTO feedback(user_id,username,category,rating,message,created,status) VALUES(?,?,?,?,?,?,?)',
-              (u['id'],u['username'],category,rating,message,now,'new'))
-    record_activity(c,u['id'],'feedback_submit',rating*5)
-    push_notice(c,u['username'],'Feedback received','Thanks — your feedback was saved to your PMA account.','feedback')
-    c.commit(); c.close()
-    return {'ok':True}
+    last_locked=None
+    for attempt in range(5):
+        c=db(); now=int(time.time())
+        try:
+            duplicate=c.execute('SELECT 1 FROM feedback WHERE user_id=? AND category=? AND rating=? AND message=? LIMIT 1',(u['id'],category,rating,message)).fetchone()
+            if duplicate:
+                c.close(); raise HTTPException(409,'You have already submitted this exact feedback.')
+            c.execute('INSERT INTO feedback(user_id,username,category,rating,message,created,status) VALUES(?,?,?,?,?,?,?)',
+                      (u['id'],u['username'],category,rating,message,now,'new'))
+            record_activity(c,u['id'],'feedback_submit',rating*5)
+            push_notice(c,u['username'],'Feedback received','Thanks — your feedback was saved to your PMA account.','feedback')
+            c.commit(); c.close()
+            return {'ok':True}
+        except sqlite3.OperationalError as e:
+            try:c.rollback(); c.close()
+            except Exception:pass
+            if 'locked' not in str(e).lower(): raise
+            last_locked=e
+            time.sleep(0.25*(attempt+1))
+        except Exception:
+            try:c.close()
+            except Exception:pass
+            raise
+    raise HTTPException(503,'The feedback service is busy. Please try again in a moment.')
 
 
 @app.get('/api/feedback')
