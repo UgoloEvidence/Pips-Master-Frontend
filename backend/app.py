@@ -822,7 +822,7 @@ def candles(symbol: str='EURUSD', timeframe: str='15m'):
 
 @app.get('/api/day-trade/plan')
 def day_trade_plan(market: str='Forex', symbols: str='EURUSD,GBPUSD,USDJPY,GBPJPY,XAUUSD,BTCUSD', timeframe: str='15m'):
-    requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:8]
+    requested=[x.strip().upper() for x in symbols.split(',') if x.strip()][:40]
     results=[]; errors=[]
     tfs=['15m','30m','1h','4h','1d']
     if timeframe not in tfs: tfs.append(timeframe)
@@ -949,6 +949,8 @@ def progress(req: Request):
     monthly_refs=c.execute("SELECT COUNT(*) AS n FROM referrals WHERE referrer_id=? AND status='qualified' AND challenge_month=?",(u['id'],month_key())).fetchone()['n']
     streak=daily_streak(c,u['id'])
     rank=rank_for_xp(user['xp'] or 0)
+    if user.get('role')=='admin':
+        rank={'rank':'Pips Master','xp':max(int(user['xp'] or 0),650000),'rank_progress':100.0,'rank_min_xp':650000,'next_rank':None,'next_rank_xp':None}
     learning_pct=round(len(completed_lessons)/len(LESSONS)*100,1)
     tasks_pct=round(len(completed_tasks)/len(TASKS)*100,1)
     referral_pct=round(min(100,lifetime_refs/250*100),1)
@@ -961,7 +963,7 @@ def progress(req: Request):
         'referral_progress':referral_pct,'consistency_progress':consistency_pct,'streak':streak,
         'completed_lessons':len(completed_lessons),'total_lessons':len(LESSONS),'completed_tasks':len(completed_tasks),'total_tasks':len(TASKS),'completed_daily_tasks':len(completed_daily),'total_daily_tasks':len(DAILY_TASKS),
         'qualified_referrals_lifetime':lifetime_refs,'qualified_referrals_this_month':monthly_refs,
-        'levels_are_long_term':True,'rank_factors':['qualified referrals','completed tasks','learning progress','overall progress/consistency'],
+        'levels_are_long_term':True,'rank_levels':[{'name':n,'xp':xp} for n,xp in RANKS],'rank_factors':['qualified referrals','completed tasks','learning progress','overall progress/consistency'],
         'lessons':LESSONS,'tasks':TASKS,'daily_tasks':DAILY_TASKS,'completed_lesson_ids':[r['lesson_id'] for r in completed_lessons],'completed_task_ids':[r['task_id'] for r in completed_tasks],'completed_daily_task_ids':[r['task_id'] for r in completed_daily],
     }
 

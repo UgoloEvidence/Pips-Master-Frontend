@@ -1,0 +1,24 @@
+Pips Master Academy — Update 2026-09-23
+
+Requested changes implemented:
+- Day Trade Monitor keeps timeframe but has no focus-pair selector.
+- Day Trade Monitor requests the complete configured market universe in one verified batch request for faster loading.
+- Instruments are grouped by Moving in our direction / Moving against us / Waiting.
+- Day Trade Monitor now shows Scanner History & Setup Reason immediately after the monitor cards.
+- Trading History is shown in About Us instead of inside Day Trade Monitor.
+- About Us rating display starts with visible seeded counts and 5-star 70%, 4-star 63%, 3-star 20%, 2-star 5%, 1-star 1%. Real reviews update counts and percentages gradually.
+- Community retention controls are Off / 24 hours / 7 days and apply only to Community. Private chats are not affected.
+- Community interface restored; the manual Community refresh button was removed.
+- Voice notes are available to all Community members through the browser microphone and are stored as message audio.
+- Voice/video call controls are visible only to the administrator. Actual live WebRTC signalling is still a separate production service requirement.
+- Telegram/customer-care contact was removed from About Us and the Q&A answer.
+- Q&A remains an expandable accordion.
+- TradingView theme iframe receives a cache-busting reload when switching theme so light/dark follows the website.
+- Pull-to-refresh gesture is enabled on the main app scroll area; no page-refresh button is required for that gesture.
+- My Progress includes the full academic rank ladder, maximum Pips Master rank, progress path and learning badges.
+- Admin progress is displayed at the maximum Pips Master rank.
+- Login/authentication code was not changed in this update.
+- Existing account token, profile picture, community messages and server-side account data are not intentionally cleared by this update.
+
+Production persistence note:
+- Render SQLite remains subject to Render filesystem persistence limitations. True long-term cross-device persistence requires supported persistent storage/PostgreSQL.
