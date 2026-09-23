@@ -14,6 +14,110 @@
 
 /* Visual refresh */
 .photo-section{margin-top:20px}.photo-grid{display:grid;grid-template-columns:1.25fr .75fr;gap:16px}.photo-card{position:relative;overflow:hidden;min-height:240px;padding:0;background:#0b141c}.photo-card img{width:100%;height:100%;min-height:240px;object-fit:cover;display:block;transition:transform .35s ease}.photo-card:hover img{transform:scale(1.035)}.photo-overlay{position:absolute;inset:auto 0 0;padding:35px 20px 18px;background:linear-gradient(transparent,rgba(0,0,0,.88))}.photo-overlay h3{margin:0 0 5px}.photo-grid-small{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:16px}.real-photo{width:100%;height:190px;object-fit:cover;border-radius:14px;display:block}.review-avatar{background:#17242d;object-fit:cover;width:58px;height:58px;border-radius:50%;border:2px solid #2c4a57}.image-band{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:18px}.image-band img{width:100%;height:150px;object-fit:cover;border-radius:14px;display:block}.copy-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.copy-row .search{margin:0}.save-state{font-size:12px;color:#8ea4ad;margin-top:8px}@media(max-width:900px){.photo-grid{grid-template-columns:1fr}.photo-grid-small{grid-template-columns:1fr 1fr}.image-band{grid-template-columns:repeat(2,1fr)}}@media(max-width:520px){.photo-grid-small{grid-template-columns:1fr}.image-band{grid-template-columns:1fr}}
+
+/* PMA Mature Color System — restrained 4-tone palette
+   Base: charcoal/plum | Surface: warm slate-plum | Accent: copper | Accent 2: sage/gold
+   Trading-state colors remain intentionally stronger: BUY=green, SELL=red, NEUTRAL=gold.
+*/
+:root{
+  --pma-bg:#17151a;
+  --pma-bg-2:#211d23;
+  --pma-surface:#2a252c;
+  --pma-surface-2:#332d35;
+  --pma-border:#514750;
+  --pma-text:#f1ebe5;
+  --pma-muted:#b8aca8;
+  --pma-copper:#c47a4b;
+  --pma-copper-soft:#8f5a42;
+  --pma-sage:#748b73;
+  --pma-gold:#b99a52;
+  --pma-shadow:rgba(15,11,15,.38);
+}
+html,body{background:var(--pma-bg);color:var(--pma-text)}
+body{background:
+  radial-gradient(circle at 8% 0%,rgba(196,122,75,.09),transparent 30%),
+  radial-gradient(circle at 92% 100%,rgba(116,139,115,.08),transparent 32%),
+  var(--pma-bg)}
+.landing{background:
+  linear-gradient(120deg,rgba(23,21,26,.94),rgba(42,37,44,.88)),
+  url('https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?auto=format&fit=crop&w=1400&q=85') center/cover}
+.brand span{color:var(--pma-copper)}
+.btn{background:var(--pma-copper);color:#fff7f1}
+.btn.alt{background:var(--pma-sage);color:#fff}
+.btn.ghost{border-color:var(--pma-border);color:var(--pma-text)}
+.pill,.chip,.icon-btn{background:var(--pma-surface);border-color:var(--pma-border);color:#e9dfd9}
+.chip.active{border-color:var(--pma-copper);color:#e3a27d}
+.side{background:#1d1920;border-color:var(--pma-border)}
+.side button{color:#c5b9b5}
+.side button:hover,.side button.on{background:#332a31;color:#e3a27d}
+.main{background:transparent}
+.bar{background:rgba(29,25,32,.94);border-color:var(--pma-border)}
+.screen{background:transparent}
+.card,.authbox,.notif-panel{background:linear-gradient(145deg,var(--pma-surface),var(--pma-surface-2));border-color:var(--pma-border);box-shadow:0 14px 34px var(--pma-shadow)}
+.card:hover{border-color:#6b5b62}
+.auth{background:
+  radial-gradient(circle at 18% 12%,rgba(196,122,75,.16),transparent 28%),
+  radial-gradient(circle at 85% 88%,rgba(116,139,115,.13),transparent 30%),
+  var(--pma-bg)}
+.authbox{background:var(--pma-surface)}
+.form h2,.section-title{color:#f5eee8}
+.form p,.lead,.muted{color:var(--pma-muted)}
+.field label{color:#cbbfba}
+.field input,.field select,.field textarea,.search{background:#211d23;border-color:var(--pma-border);color:#f4ece7}
+.field input:focus,.field select:focus,.field textarea:focus,.search:focus{border-color:var(--pma-copper);box-shadow:0 0 0 3px rgba(196,122,75,.12)}
+.feature-img,.home-hero-img,.real-photo,.mini-img{box-shadow:0 10px 28px rgba(0,0,0,.22)}
+.table th,.table td{border-color:#4a4148}
+.signal{border-left-color:var(--pma-copper)}
+.count,.eta,.near-eta{color:#d99a73}
+.zone-badge{background:#332a31;border-color:#66545d}
+.scanner-stats span,.trend-box.unavailable{background:#29242b;border-color:#4d444b}
+.scanner-stats b{color:#eee4de}
+.toast{background:#30272e;border-color:var(--pma-copper)}
+.feedback-rating .rating-choice{background:#2a252c;border-color:#514750}
+.admin-panel{border-color:var(--pma-gold)}
+.star{color:var(--pma-gold)}
+.footer-note{border-color:#4a4148;color:#9f9390}
+.pull-refresh{background:#2b252b;border-color:var(--pma-copper)}
+/* Trading states intentionally stay distinct from the mature base palette. */
+.trend-box.bullish{background:linear-gradient(135deg,#2e704e,#3f8b60);border-color:#78c28d}
+.trend-box.bearish{background:linear-gradient(135deg,#8f3036,#b7474e);border-color:#ed777c}
+.trend-box.neutral{background:linear-gradient(135deg,#8a6a27,#a98635);border-color:#d6b45c}
+.signal.buy,.signal.bullish{border-left-color:#62b77b}
+.signal.sell,.signal.bearish{border-left-color:#d95c63}
+.signal.neutral{border-left-color:#c8a34d}
+
+/* Light mode: warm ivory + plum + copper + sage; never pure white. */
+body.light{
+  --pma-bg:#f2eee8;
+  --pma-bg-2:#e8e1da;
+  --pma-surface:#fbf8f3;
+  --pma-surface-2:#eee7e0;
+  --pma-border:#d1c5bd;
+  --pma-text:#30292e;
+  --pma-muted:#71666a;
+  --pma-shadow:rgba(57,45,38,.12);
+  background:
+    radial-gradient(circle at 8% 0%,rgba(196,122,75,.12),transparent 30%),
+    radial-gradient(circle at 92% 100%,rgba(116,139,115,.12),transparent 32%),
+    var(--pma-bg);
+  color:var(--pma-text)
+}
+body.light .landing{background:linear-gradient(120deg,rgba(242,238,232,.94),rgba(232,225,218,.88)),url('https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?auto=format&fit=crop&w=1400&q=85') center/cover}
+body.light .side{background:#e8e1da;border-color:#cfc3ba}
+body.light .side button{color:#5e5357}
+body.light .side button:hover,body.light .side button.on{background:#dcd1c9;color:#87543d}
+body.light .bar{background:rgba(232,225,218,.95);border-color:#d1c5bd}
+body.light .card,body.light .authbox,body.light .notif-panel{background:linear-gradient(145deg,#fbf8f3,#eee7e0);border-color:#d1c5bd;box-shadow:0 12px 30px rgba(57,45,38,.10)}
+body.light .pill,body.light .chip,body.light .icon-btn{background:#eee7e0;border-color:#d1c5bd;color:#51484c}
+body.light .field input,body.light .field select,body.light .field textarea,body.light .search{background:#f7f2ed;border-color:#d1c5bd;color:#30292e}
+body.light .field input:focus,body.light .field select:focus,body.light .field textarea:focus,body.light .search:focus{border-color:#b86f49;box-shadow:0 0 0 3px rgba(196,122,75,.12)}
+body.light .form p,body.light .lead,body.light .muted{color:#71666a}
+body.light .table th,body.light .table td{border-color:#d7ccc4}
+body.light .scanner-stats span,body.light .trend-box.unavailable{background:#eee7e0;border-color:#d1c5bd}
+body.light .scanner-stats b{color:#3a3135}
+body.light .toast{background:#fbf8f3;border-color:#b86f49;color:#30292e}
+body.light .pull-refresh{background:#fbf8f3;border-color:#b86f49;color:#30292e}
+
 </style>
 <style>
 :root{--mint:#41e6a4;--violet:#9b7bff;--blue:#54c7ff;--pink:#ff6fb5;--gold:#ffd166;--orange:#ff9f43;--cyan:#36e0d0}

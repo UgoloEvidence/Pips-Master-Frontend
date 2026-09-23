@@ -1,0 +1,8 @@
+PMA Mature Color Update
+
+Palette:
+- Dark mode: charcoal/plum base, warm slate-plum surfaces, copper accent, sage/gold secondary accents.
+- Light mode: warm ivory/taupe base, plum surfaces/text, copper accent, sage/gold secondary accents.
+- Trading states remain distinct: BUY green, SELL red, NEUTRAL gold.
+
+The update is intentionally restrained to a small mature palette rather than many unrelated colors.
