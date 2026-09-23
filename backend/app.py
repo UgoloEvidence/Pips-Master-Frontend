@@ -962,7 +962,7 @@ def progress(req: Request):
         'completed_lessons':len(completed_lessons),'total_lessons':len(LESSONS),'completed_tasks':len(completed_tasks),'total_tasks':len(TASKS),'completed_daily_tasks':len(completed_daily),'total_daily_tasks':len(DAILY_TASKS),
         'qualified_referrals_lifetime':lifetime_refs,'qualified_referrals_this_month':monthly_refs,
         'levels_are_long_term':True,'rank_factors':['qualified referrals','completed tasks','learning progress','overall progress/consistency'],
-        'lessons':LESSONS,'tasks':TASKS,'daily_tasks':DAILY_TASKS,'completed_daily_task_ids':[r['task_id'] for r in completed_daily],
+        'lessons':LESSONS,'tasks':TASKS,'daily_tasks':DAILY_TASKS,'completed_lesson_ids':[r['lesson_id'] for r in completed_lessons],'completed_task_ids':[r['task_id'] for r in completed_tasks],'completed_daily_task_ids':[r['task_id'] for r in completed_daily],
     }
 
 
