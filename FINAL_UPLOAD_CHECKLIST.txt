@@ -1,0 +1,25 @@
+PIPS MASTER ACADEMY — FINAL UPLOAD BUILD CHECKLIST
+
+Scoped final changes:
+- Community live voice/video calls removed from the frontend.
+- Obsolete community call API routes removed from backend.
+- Admin-only browser voice-note recording added.
+- Voice notes are stored with community messages as audio media and members can play them.
+- Backend rejects audio/voice-note messages from non-admin members.
+- About/Q&A support wording now directs users to request Community access and ask questions there; Telegram/Customer Service wording removed.
+- Learning/task completion remains account-backed; duplicate completion does not award XP again.
+- Daily-task completions remain recorded by user/day; progress API also reports lifetime daily-task completion instances.
+- Consistency activity remains recorded in the activity log.
+- Streak display now counts consecutive completed intervals, so yesterday + today displays as 1 day streak as requested.
+- Existing Day Trade Monitor, all-market cards, timeframe selector, refresh, prefetch cache and Trading History flow retained.
+- Login code was not modified by this patch.
+
+Static verification completed:
+- Python backend compiles successfully with py_compile.
+- Embedded frontend JavaScript passes Node syntax check.
+- frontend/app.js, root app.js and frontend_embedded.js pass Node syntax check.
+- No remaining frontend call-function references, Telegram Customer Service wording, or Contact Support FAQ wording.
+- Day Trade functions and prefetch remain present.
+
+Deployment note:
+The account database is still SQLite. Account progress is saved server-side while that database persists; true cross-redeploy permanent persistence on Render requires a persistent disk or Postgres.

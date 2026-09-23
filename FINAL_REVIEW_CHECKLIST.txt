@@ -1,0 +1,29 @@
+PIPS MASTER ACADEMY — FINAL TARGETED REVIEW
+
+Scope of this update:
+- Notification history deletion now has a server-side clear timestamp so deleted history cannot immediately reappear from a stale client/cache.
+- Added /api/referrals/tree for real L1/L2/L3 referral relationships.
+- Referral page now displays L1/L2/L3 counts and the actual tree.
+- Admin Community Members list now includes a Referral Tree action for each member.
+- Qualified direct referrals continue to contribute XP to academy rank/progress; deeper L2/L3 levels are displayed as actual network relationships and are not assigned invented XP rewards.
+- Added the missing Community Leave action so its confirmation does not lead to a non-working button.
+- Removed the entire Contact Us card and Telegram contact link from the About Us page.
+- Existing feedback/review rating summary retained: live average, 100+ display, 5/4/3/2/1 bars, 100% endpoint labels.
+- Existing FAQ accordion retained.
+- Existing community retention controls remain Off / 24 hours / 7 days and are community-only.
+- Existing admin community lock control retained.
+- Existing Day Trade and call changes from the previous build are preserved.
+- Login endpoint was compared with the previous build and is unchanged.
+
+Static verification:
+- backend/app.py: Python syntax OK.
+- frontend_embedded.js: JavaScript syntax OK.
+- frontend/app.js: JavaScript syntax OK.
+- app.js: JavaScript syntax OK.
+- All direct onclick function references resolve to defined functions after this review.
+- Contact Us card/link absent from deployed frontend/index.html.
+- Referral tree endpoint and UI references present.
+- Notification deletion endpoint and UI present.
+
+Note:
+- Full live call testing requires browser permissions/camera/microphone and a running deployed backend. This package does not claim a live WebRTC call was physically tested in this static review environment.

@@ -85,6 +85,7 @@ class Signup(BaseModel):
     email: EmailStr
     password: str
     confirm_password: str
+    dob: str = ''
     referral: str = ''
 
 
@@ -186,9 +187,6 @@ def db():
                 CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, event_type TEXT NOT NULL, created INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS trade_history(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, market TEXT NOT NULL, timeframe TEXT NOT NULL, direction TEXT NOT NULL, entry REAL, stop_loss REAL, take_profit REAL, outcome TEXT NOT NULL, reason TEXT DEFAULT '', opened_at INTEGER NOT NULL, closed_at INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS signal_history(id INTEGER PRIMARY KEY, user_id INTEGER, symbol TEXT NOT NULL, market TEXT NOT NULL, timeframe TEXT NOT NULL, direction TEXT NOT NULL, status TEXT NOT NULL, setup_strength REAL, entry REAL, stop_loss REAL, take_profit REAL, reason TEXT DEFAULT '', event_key TEXT UNIQUE, created INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS community_calls(id INTEGER PRIMARY KEY, room_id TEXT UNIQUE NOT NULL, admin_id INTEGER NOT NULL, kind TEXT NOT NULL, status TEXT DEFAULT 'active', created INTEGER NOT NULL, ended INTEGER DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS community_call_participants(id INTEGER PRIMARY KEY, call_id INTEGER NOT NULL, user_id INTEGER NOT NULL, joined INTEGER NOT NULL, UNIQUE(call_id,user_id));
-                CREATE TABLE IF NOT EXISTS community_call_signals(id INTEGER PRIMARY KEY, call_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, receiver_id INTEGER DEFAULT 0, signal_type TEXT NOT NULL, payload TEXT NOT NULL, created INTEGER NOT NULL);
                 ''')
                 message_existing={r['name'] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
                 if 'reply_to_id' not in message_existing: c.execute("ALTER TABLE messages ADD COLUMN reply_to_id INTEGER DEFAULT 0")
@@ -310,7 +308,9 @@ def daily_streak(c, user_id):
     while cursor in day_set:
         streak += 1
         cursor -= timedelta(days=1)
-    return streak
+    # PMA displays streak as consecutive completed intervals: two consecutive
+    # active dates (yesterday + today) therefore display as a 1-day streak.
+    return max(0, streak - 1)
 
 
 def _token_pack(payload):
@@ -472,8 +472,8 @@ def signup(x: Signup):
     role = 'admin' if ADMIN_PASSWORD and str(x.email).lower() == ADMIN_EMAIL.lower() and x.password == ADMIN_PASSWORD else 'user'
     now = int(time.time())
     referrer = resolve_referrer(c, x.referral)
-    c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-              (x.username.strip(),x.full_name.strip(),str(x.email).lower(),hash_password(x.password),pma,pma.replace('-',''),referrer['username'] if referrer else '',role,now,0,now,0,1))
+    c.execute('INSERT INTO users(username,full_name,email,password,pma_id,referral_code,referrer,role,created,xp,last_active,login_count,activity_count,dob) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+              (x.username.strip(),x.full_name.strip(),str(x.email).lower(),hash_password(x.password),pma,pma.replace('-',''),referrer['username'] if referrer else '',role,now,0,now,0,1,x.dob.strip()))
     uid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
     c.execute('INSERT OR REPLACE INTO community_members(user_id,status,role,joined_at,updated_at,note) VALUES(?,?,?,?,?,?)',(uid,'approved' if role=='admin' else 'pending','admin' if role=='admin' else 'member',now if role=='admin' else 0,now,'Approved automatically for administrator' if role=='admin' else 'Awaiting administrator approval'))
     c.execute('INSERT INTO activity_log(user_id,day,event_type,created) VALUES(?,?,?,?)',(uid,datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%d'),'signup',now))
@@ -587,7 +587,10 @@ def push_unsubscribe(req: Request, x: PushSubscription):
 
 @app.get('/api/notifications')
 def notifications(req: Request):
-    u=current(req); c=db(); rows=c.execute('SELECT * FROM notifications WHERE username=? ORDER BY id DESC LIMIT 200',(u['username'],)).fetchall(); c.close()
+    u=current(req); c=db()
+    cutoff_row=c.execute("SELECT value FROM settings WHERE key=?",(f'notification_clear_before:{u["id"]}',)).fetchone()
+    cutoff=int(cutoff_row['value']) if cutoff_row and str(cutoff_row['value']).isdigit() else 0
+    rows=c.execute('SELECT * FROM notifications WHERE username=? AND created>? ORDER BY id DESC LIMIT 200',(u['username'],cutoff)).fetchall(); c.close()
     return {'notifications':[{'id':r['id'],'title':r['title'],'text':r['text'],'type':r['type'],'time':datetime.fromtimestamp(r['created'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),'read':bool(r['read']),'target_page':r['target_page'] or notification_target(r['type']),'target_ref':r['target_ref'] or ''} for r in rows]}
 
 
@@ -611,71 +614,16 @@ def notifications_read(req: Request):
 
 @app.delete('/api/notifications/history')
 def notifications_delete_history(req: Request):
-    u=current(req); c=db(); c.execute('DELETE FROM notifications WHERE username=?',(u['username'],)); c.commit(); c.close(); return {'ok':True}
+    u=current(req); now=int(time.time()); c=db()
+    c.execute('DELETE FROM notifications WHERE username=?',(u['username'],))
+    # Keep a server-side tombstone so a stale client/cache cannot immediately repopulate
+    # notifications that the user explicitly deleted. New notifications created after this
+    # timestamp are still delivered normally.
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(f'notification_clear_before:{u["id"]}',str(now)))
+    deleted=c.rowcount if c.rowcount is not None else 0
+    c.commit(); c.close(); return {'ok':True,'deleted':deleted,'cleared_at':now}
 
 
-class CommunityCallStart(BaseModel):
-    kind: str = 'voice'
-
-class CommunityCallJoin(BaseModel):
-    call_id: int
-
-class CommunityCallSignal(BaseModel):
-    call_id: int
-    signal_type: str
-    payload: str
-
-@app.get('/api/community/call/active')
-def community_call_active(req: Request):
-    u,c,m=require_community_member(req)
-    row=c.execute("SELECT * FROM community_calls WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        c.close(); return {'active':False}
-    joined=c.execute('SELECT 1 FROM community_call_participants WHERE call_id=? AND user_id=?',(row['id'],u['id'])).fetchone()
-    c.close(); return {'active':True,'call':{'id':row['id'],'room_id':row['room_id'],'kind':row['kind'],'admin_id':row['admin_id'],'joined':bool(joined)}}
-
-@app.post('/api/admin/community/call/start')
-def community_call_start(req: Request, x: CommunityCallStart):
-    u,c,m=require_community_member(req)
-    if u['role']!='admin': c.close(); raise HTTPException(403,'Admin access required.')
-    kind='video' if x.kind=='video' else 'voice'; now=int(time.time())
-    c.execute("UPDATE community_calls SET status='ended',ended=? WHERE status='active'",(now,))
-    room=secrets.token_urlsafe(18)
-    c.execute('INSERT INTO community_calls(room_id,admin_id,kind,status,created,ended) VALUES(?,?,?,?,?,0)',(room,u['id'],kind,'active',now))
-    call_id=c.execute('SELECT last_insert_rowid() id').fetchone()['id']
-    c.execute('INSERT OR REPLACE INTO community_call_participants(call_id,user_id,joined) VALUES(?,?,?)',(call_id,u['id'],now))
-    c.commit(); c.close(); return {'ok':True,'call_id':call_id,'room_id':room,'kind':kind}
-
-@app.post('/api/community/call/join')
-def community_call_join(req: Request, x: CommunityCallJoin):
-    u,c,m=require_community_member(req)
-    row=c.execute("SELECT * FROM community_calls WHERE id=? AND status='active'",(x.call_id,)).fetchone()
-    if not row: c.close(); raise HTTPException(404,'No active community call.')
-    now=int(time.time()); c.execute('INSERT OR REPLACE INTO community_call_participants(call_id,user_id,joined) VALUES(?,?,?)',(x.call_id,u['id'],now));
-    if u['id'] != row['admin_id']:
-        c.execute('INSERT INTO community_call_signals(call_id,sender_id,receiver_id,signal_type,payload,created) VALUES(?,?,?,?,?,?)',(x.call_id,u['id'],row['admin_id'],'join',json.dumps({'user_id':u['id'],'username':u['username']}),now))
-    c.commit(); c.close(); return {'ok':True}
-
-@app.post('/api/community/call/signal')
-def community_call_signal(req: Request, x: CommunityCallSignal):
-    u,c,m=require_community_member(req)
-    row=c.execute("SELECT * FROM community_calls WHERE id=? AND status='active'",(x.call_id,)).fetchone()
-    if not row: c.close(); raise HTTPException(404,'Call has ended.')
-    participant=c.execute('SELECT 1 FROM community_call_participants WHERE call_id=? AND user_id=?',(x.call_id,u['id'])).fetchone()
-    if not participant: c.close(); raise HTTPException(403,'Join the call first.')
-    now=int(time.time()); c.execute('INSERT INTO community_call_signals(call_id,sender_id,receiver_id,signal_type,payload,created) VALUES(?,?,?,?,?,?)',(x.call_id,u['id'],0,x.signal_type,x.payload,now)); c.commit(); c.close(); return {'ok':True}
-
-@app.get('/api/community/call/signals')
-def community_call_signals(req: Request, call_id: int, after: int = 0):
-    u,c,m=require_community_member(req)
-    rows=c.execute('SELECT id,sender_id,signal_type,payload,created FROM community_call_signals WHERE call_id=? AND id>? AND sender_id<>? ORDER BY id ASC LIMIT 200',(call_id,after,u['id'])).fetchall()
-    c.close(); return {'signals':[dict(r) for r in rows]}
-
-@app.post('/api/admin/community/call/end')
-def community_call_end(req: Request, x: CommunityCallJoin):
-    u,c,m=require_community_member(req)
-    if u['role']!='admin': c.close(); raise HTTPException(403,'Admin access required.')
-    now=int(time.time()); c.execute("UPDATE community_calls SET status='ended',ended=? WHERE id=?",(now,x.call_id)); c.commit(); c.close(); return {'ok':True}
 
 class Feedback(BaseModel):
     category: str = 'General'
@@ -692,6 +640,9 @@ def submit_feedback(req: Request, x: Feedback):
     rating=max(1,min(5,int(x.rating)))
     category=(x.category or 'General').strip()[:40]
     c=db(); now=int(time.time())
+    duplicate=c.execute('SELECT 1 FROM feedback WHERE user_id=? AND category=? AND rating=? AND message=? LIMIT 1',(u['id'],category,rating,message)).fetchone()
+    if duplicate:
+        c.close(); raise HTTPException(409,'You have already submitted this exact feedback.')
     c.execute('INSERT INTO feedback(user_id,username,category,rating,message,created,status) VALUES(?,?,?,?,?,?,?)',
               (u['id'],u['username'],category,rating,message,now,'new'))
     record_activity(c,u['id'],'feedback_submit',rating*5)
@@ -990,6 +941,38 @@ def referrals(req: Request, month: str=''):
     }
 
 
+@app.get('/api/referrals/tree')
+def referral_tree(req: Request, user_id: int | None = None):
+    u=current(req)
+    target_id=int(user_id or u['id'])
+    if u['role']!='admin' and target_id!=u['id']:
+        raise HTTPException(403,'You can only view your own referral tree.')
+    c=db(); qualify_referrals(c)
+    root=c.execute('SELECT id,username,full_name,profile_picture,role,xp FROM users WHERE id=?',(target_id,)).fetchone()
+    if not root:
+        c.close(); raise HTTPException(404,'Referral member not found.')
+    def build(parent_id, level, seen):
+        if level>3: return []
+        rows=c.execute('''SELECT u.id,u.username,u.full_name,u.profile_picture,u.role,u.xp,r.status,r.challenge_month,r.qualified_at
+                          FROM referrals r JOIN users u ON u.id=r.referred_id
+                          WHERE r.referrer_id=? ORDER BY u.username COLLATE NOCASE''',(parent_id,)).fetchall()
+        out=[]
+        for r in rows:
+            if r['id'] in seen: continue
+            child_seen=set(seen); child_seen.add(r['id'])
+            out.append({'id':r['id'],'username':r['username'],'full_name':r['full_name'],'profile_picture':r['profile_picture'] or '','role':r['role'],'xp':r['xp'] or 0,'level':level,'status':r['status'],'challenge_month':r['challenge_month'],'qualified_at':r['qualified_at'],'children':build(r['id'],level+1,child_seen)})
+        return out
+    tree=build(root['id'],1,{root['id']})
+    counts={1:0,2:0,3:0}
+    def count_nodes(nodes):
+        for n in nodes:
+            counts[n['level']]=counts.get(n['level'],0)+1
+            count_nodes(n['children'])
+    count_nodes(tree)
+    c.close()
+    return {'root':{'id':root['id'],'username':root['username'],'full_name':root['full_name'],'profile_picture':root['profile_picture'] or '','role':root['role'],'xp':root['xp'] or 0},'counts':{'L1':counts[1],'L2':counts[2],'L3':counts[3]},'tree':tree,'rank_note':'Qualified direct referrals already contribute XP to academy rank. L1/L2/L3 levels here describe the actual referral network; no extra XP is invented for deeper levels.'}
+
+
 @app.get('/api/leaderboard')
 def leaderboard(req: Request, month: str=''):
     u=current(req); c=db(); qualify_referrals(c); mk=month or month_key()
@@ -1011,6 +994,7 @@ def progress(req: Request):
     completed_tasks=c.execute('SELECT task_id FROM task_progress WHERE user_id=?',(u['id'],)).fetchall()
     today=datetime.now(timezone.utc).strftime('%Y-%m-%d')
     completed_daily=c.execute('SELECT task_id FROM daily_task_progress WHERE user_id=? AND day=?',(u['id'],today)).fetchall()
+    completed_daily_total=c.execute('SELECT COUNT(*) AS n FROM daily_task_progress WHERE user_id=?',(u['id'],)).fetchone()['n']
     lifetime_refs=c.execute("SELECT COUNT(*) AS n FROM referrals WHERE referrer_id=? AND status='qualified'",(u['id'],)).fetchone()['n']
     monthly_refs=c.execute("SELECT COUNT(*) AS n FROM referrals WHERE referrer_id=? AND status='qualified' AND challenge_month=?",(u['id'],month_key())).fetchone()['n']
     streak=daily_streak(c,u['id'])
@@ -1025,7 +1009,7 @@ def progress(req: Request):
     return {
         'xp':user['xp'] or 0,**rank,'overall_progress':overall,'learning_progress':learning_pct,'tasks_progress':tasks_pct,
         'referral_progress':referral_pct,'consistency_progress':consistency_pct,'streak':streak,
-        'completed_lessons':len(completed_lessons),'total_lessons':len(LESSONS),'completed_tasks':len(completed_tasks),'total_tasks':len(TASKS),'completed_daily_tasks':len(completed_daily),'total_daily_tasks':len(DAILY_TASKS),
+        'completed_lessons':len(completed_lessons),'total_lessons':len(LESSONS),'completed_tasks':len(completed_tasks),'total_tasks':len(TASKS),'completed_daily_tasks':len(completed_daily),'total_daily_tasks':len(DAILY_TASKS),'completed_daily_task_instances':completed_daily_total,
         'qualified_referrals_lifetime':lifetime_refs,'qualified_referrals_this_month':monthly_refs,
         'levels_are_long_term':True,'rank_factors':['qualified referrals','completed tasks','learning progress','overall progress/consistency'],
         'lessons':LESSONS,'tasks':TASKS,'daily_tasks':DAILY_TASKS,'completed_lesson_ids':[r['lesson_id'] for r in completed_lessons],'completed_task_ids':[r['task_id'] for r in completed_tasks],'completed_daily_task_ids':[r['task_id'] for r in completed_daily],
@@ -1179,6 +1163,8 @@ def post_message(req: Request, x: Msg):
     u,c,m=require_community_member(req); is_locked=get_locked(c)
     if is_locked and u['role']!='admin': c.close(); raise HTTPException(403,'Community chat is locked by the administrator.')
     if not x.text.strip() and not x.media_data: c.close(); raise HTTPException(400,'Message cannot be empty.')
+    if x.media_data and len(x.media_data)>7*1024*1024: c.close(); raise HTTPException(413,'Media is too large. Please keep it under 5MB.')
+    if x.media_data and (x.media_type or '').startswith('audio') and u['role']!='admin': c.close(); raise HTTPException(403,'Only the administrator can send voice notes.')
     reply_id=int(x.reply_to_id or 0)
     if reply_id and not c.execute('SELECT 1 FROM messages WHERE id=?',(reply_id,)).fetchone(): reply_id=0
     settings=community_settings_row(c); now=int(time.time())
