@@ -614,17 +614,22 @@ def notifications_read(req: Request):
 
 @app.delete('/api/notifications/history')
 def notifications_delete_history(req: Request):
-    u=current(req); now=int(time.time()); c=db()
-    cur=c.execute('DELETE FROM notifications WHERE username=?',(u['username'],))
-    deleted=cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
-    # Keep a server-side tombstone so a stale client/cache cannot immediately repopulate
-    # notifications that the user explicitly deleted. New notifications created after this
-    # timestamp are still delivered normally.
-    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(f'notification_clear_before:{u["id"]}',str(now)))
-    c.commit()
-    remaining=c.execute('SELECT COUNT(*) AS n FROM notifications WHERE username=?',(u['username'],)).fetchone()['n']
-    c.close()
-    return {'ok':True,'deleted':deleted,'remaining':remaining,'cleared_at':now}
+    u=current(req); now=int(time.time())
+    c=db()
+    try:
+        # Make the deletion and its tombstone one atomic database operation.
+        c.execute('BEGIN IMMEDIATE')
+        cur=c.execute('DELETE FROM notifications WHERE username=?',(u['username'],))
+        deleted=cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(f'notification_clear_before:{u["id"]}',str(now)))
+        remaining=c.execute('SELECT COUNT(*) AS n FROM notifications WHERE username=? AND created<=?',(u['username'],now)).fetchone()['n']
+        if remaining:
+            c.rollback()
+            raise HTTPException(503,'Notification history could not be fully cleared. Please retry.')
+        c.commit()
+    finally:
+        c.close()
+    return {'ok':True,'deleted':deleted,'remaining':0,'cleared_at':now,'auto_delete_days':14}
 
 
 
@@ -642,30 +647,16 @@ def submit_feedback(req: Request, x: Feedback):
         raise HTTPException(400,'Please write your feedback before sending.')
     rating=max(1,min(5,int(x.rating)))
     category=(x.category or 'General').strip()[:40]
-    last_locked=None
-    for attempt in range(5):
-        c=db(); now=int(time.time())
-        try:
-            duplicate=c.execute('SELECT 1 FROM feedback WHERE user_id=? AND category=? AND rating=? AND message=? LIMIT 1',(u['id'],category,rating,message)).fetchone()
-            if duplicate:
-                c.close(); raise HTTPException(409,'You have already submitted this exact feedback.')
-            c.execute('INSERT INTO feedback(user_id,username,category,rating,message,created,status) VALUES(?,?,?,?,?,?,?)',
-                      (u['id'],u['username'],category,rating,message,now,'new'))
-            record_activity(c,u['id'],'feedback_submit',rating*5)
-            push_notice(c,u['username'],'Feedback received','Thanks — your feedback was saved to your PMA account.','feedback')
-            c.commit(); c.close()
-            return {'ok':True}
-        except sqlite3.OperationalError as e:
-            try:c.rollback(); c.close()
-            except Exception:pass
-            if 'locked' not in str(e).lower(): raise
-            last_locked=e
-            time.sleep(0.25*(attempt+1))
-        except Exception:
-            try:c.close()
-            except Exception:pass
-            raise
-    raise HTTPException(503,'The feedback service is busy. Please try again in a moment.')
+    c=db(); now=int(time.time())
+    duplicate=c.execute('SELECT 1 FROM feedback WHERE user_id=? AND category=? AND rating=? AND message=? LIMIT 1',(u['id'],category,rating,message)).fetchone()
+    if duplicate:
+        c.close(); raise HTTPException(409,'You have already submitted this exact feedback.')
+    c.execute('INSERT INTO feedback(user_id,username,category,rating,message,created,status) VALUES(?,?,?,?,?,?,?)',
+              (u['id'],u['username'],category,rating,message,now,'new'))
+    record_activity(c,u['id'],'feedback_submit',rating*5)
+    push_notice(c,u['username'],'Feedback received','Thanks — your feedback was saved to your PMA account.','feedback')
+    c.commit(); c.close()
+    return {'ok':True}
 
 
 @app.get('/api/feedback')
@@ -1379,10 +1370,33 @@ def update_community_settings(req: Request, x: CommunitySettings):
 def toggle(req: Request):
     u=current(req)
     if u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    c=db(); new_state=not get_locked(c); set_locked(c,new_state)
-    users=c.execute('SELECT username FROM users').fetchall()
-    for r in users: push_notice(c,r['username'],'Community status','The community is now '+('locked.' if new_state else 'open.'),'community')
-    c.commit(); c.close(); return {'locked':new_state}
+    last=None
+    for attempt in range(5):
+        c=db()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            new_state=not get_locked(c)
+            set_locked(c,new_state)
+            # Persist the lock state first. Notification creation is best-effort and
+            # must never prevent the actual community lock from being committed.
+            try:
+                users=c.execute('SELECT username FROM users WHERE username<>?',(u['username'],)).fetchall()
+                for r in users:
+                    push_notice(c,r['username'],'Community status','The community is now '+('locked.' if new_state else 'open.'),'community')
+            except Exception:
+                pass
+            c.commit()
+            last=new_state
+            break
+        except sqlite3.OperationalError as e:
+            try: c.rollback()
+            except Exception: pass
+            if 'locked' not in str(e).lower() or attempt==4:
+                raise HTTPException(503,'Community lock is temporarily busy. Please try again.')
+            time.sleep(0.25*(attempt+1))
+        finally:
+            c.close()
+    return {'locked':bool(last),'ok':True}
 
 
 @app.get('/api/admin/status')
