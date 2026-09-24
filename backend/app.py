@@ -176,7 +176,7 @@ def db():
                 c.executescript('''
                 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, full_name TEXT, email TEXT UNIQUE, password TEXT, pma_id TEXT UNIQUE, referral_code TEXT UNIQUE, referrer TEXT, role TEXT DEFAULT 'user', phone TEXT DEFAULT '', dob TEXT DEFAULT '', profile_picture TEXT DEFAULT '', created INTEGER, xp INTEGER DEFAULT 0, last_active INTEGER DEFAULT 0, login_count INTEGER DEFAULT 0, activity_count INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, username TEXT, pma_id TEXT, text TEXT, media_data TEXT DEFAULT '', media_type TEXT DEFAULT '', reply_to_id INTEGER DEFAULT 0, edited INTEGER DEFAULT 0, created INTEGER, temporary INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0, deleted_by TEXT DEFAULT '', deleted_at INTEGER DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS community_members(user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member', warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0, note TEXT DEFAULT '', featured INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS community_members(user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending', role TEXT DEFAULT 'member', warning_count INTEGER DEFAULT 0, suspended_until INTEGER DEFAULT 0, joined_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0, note TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT DEFAULT 'PMA Community', bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.', profile_picture TEXT DEFAULT '', disappearing_seconds INTEGER DEFAULT 86400, temporary_enabled INTEGER DEFAULT 0, temporary_seconds INTEGER DEFAULT 86400, updated_at INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, username TEXT, title TEXT, text TEXT, type TEXT DEFAULT 'info', created INTEGER, read INTEGER DEFAULT 0, target_page TEXT DEFAULT '', target_ref TEXT DEFAULT ''); CREATE TABLE IF NOT EXISTS push_subscriptions(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created INTEGER DEFAULT 0, updated INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
@@ -194,8 +194,6 @@ def db():
                 if 'edited' not in message_existing: c.execute("ALTER TABLE messages ADD COLUMN edited INTEGER DEFAULT 0")
                 for name,ddl in {'temporary':'ALTER TABLE messages ADD COLUMN temporary INTEGER DEFAULT 0','expires_at':'ALTER TABLE messages ADD COLUMN expires_at INTEGER DEFAULT 0','deleted':'ALTER TABLE messages ADD COLUMN deleted INTEGER DEFAULT 0','deleted_by':'ALTER TABLE messages ADD COLUMN deleted_by TEXT DEFAULT ''','deleted_at':'ALTER TABLE messages ADD COLUMN deleted_at INTEGER DEFAULT 0'}.items():
                     if name not in message_existing: c.execute(ddl)
-                community_members_existing={r['name'] for r in c.execute("PRAGMA table_info(community_members)").fetchall()}
-                if 'featured' not in community_members_existing: c.execute("ALTER TABLE community_members ADD COLUMN featured INTEGER DEFAULT 0")
                 community_settings_existing={r['name'] for r in c.execute("PRAGMA table_info(community_settings)").fetchall()}
                 if 'bio' not in community_settings_existing: c.execute("ALTER TABLE community_settings ADD COLUMN bio TEXT DEFAULT 'A place for PMA members to learn, share and discuss the markets.'")
                 if 'temporary_enabled' not in community_settings_existing: c.execute("ALTER TABLE community_settings ADD COLUMN temporary_enabled INTEGER DEFAULT 0")
@@ -668,6 +666,7 @@ def submit_feedback(req: Request, x: Feedback):
     c.execute('INSERT INTO feedback(user_id,username,category,rating,message,created,status) VALUES(?,?,?,?,?,?,?)',
               (u['id'],u['username'],category,rating,message,now,'new'))
     record_activity(c,u['id'],'feedback_submit',rating*5)
+    push_notice(c,u['username'],'Feedback received','Thanks — your feedback was saved to your PMA account.','feedback')
     # Notify every administrator so submitted member feedback is visible to the admin.
     admins=c.execute("SELECT username FROM users WHERE role='admin'").fetchall()
     for a in admins:
@@ -1153,7 +1152,7 @@ def community_status(req: Request):
     if u['role']=='admin' and (not m or m['status']!='approved'):
         now=int(time.time()); c.execute("INSERT OR REPLACE INTO community_members(user_id,status,role,warning_count,suspended_until,joined_at,updated_at,note) VALUES(?,?,?,?,?,?,?,?)",(u['id'],'approved','admin',m['warning_count'] if m else 0,0,m['joined_at'] if m else now,now,'Administrator access')); c.commit(); m=community_member(c,u['id'])
     pending=bool(m and m['status']=='pending'); approved=bool(m and m['status']=='approved'); suspended=bool(m and m['status']=='suspended' and (m['suspended_until'] or 0)>int(time.time()))
-    locked=get_locked(c); c.close(); return {'approved':approved,'pending':pending,'suspended':suspended,'status':m['status'] if m else 'pending','role':m['role'] if m else 'member','locked':locked,'settings':settings}
+    c.close(); return {'approved':approved,'pending':pending,'suspended':suspended,'status':m['status'] if m else 'pending','role':m['role'] if m else 'member','settings':settings}
 
 @app.post('/api/community/join')
 def community_join(req: Request, x: CommunityRequest):
@@ -1167,7 +1166,7 @@ def community_join(req: Request, x: CommunityRequest):
 @app.get('/api/community/members')
 def community_member_list(req: Request):
     u,c,m=require_community_member(req)
-    rows=c.execute("SELECT u.id,u.username,u.full_name,u.pma_id,u.profile_picture,u.role,cm.status,cm.joined_at,COALESCE(cm.featured,0) featured FROM users u JOIN community_members cm ON cm.user_id=u.id WHERE cm.status='approved' ORDER BY CASE WHEN COALESCE(cm.featured,0)=1 THEN 0 ELSE 1 END, CASE WHEN u.role='admin' THEN 0 ELSE 1 END,u.username COLLATE NOCASE").fetchall()
+    rows=c.execute("SELECT u.id,u.username,u.full_name,u.pma_id,u.profile_picture,u.role,cm.status,cm.joined_at FROM users u JOIN community_members cm ON cm.user_id=u.id WHERE cm.status='approved' ORDER BY CASE WHEN u.role='admin' THEN 0 ELSE 1 END,u.username COLLATE NOCASE").fetchall()
     c.close()
     return {'members':[dict(r) for r in rows]}
 
@@ -1356,27 +1355,13 @@ def leave_community(req: Request):
     c.commit(); c.close(); return {'ok':True,'status':'removed'}
 
 @app.get('/api/admin/community/members')
-def community_members(req: Request, status: str='', q: str=''):
+def community_members(req: Request, status: str=''):
     u=current(req)
     if u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    c=db(); sql="SELECT u.id,u.username,u.full_name,u.email,u.pma_id,u.profile_picture,u.last_active,u.role AS account_role, cm.status,cm.role AS community_role,cm.warning_count,cm.suspended_until,cm.joined_at,cm.note,COALESCE(cm.featured,0) featured FROM users u JOIN community_members cm ON cm.user_id=u.id"; params=[]
-    clauses=[]
-    if status: clauses.append('cm.status=?'); params.append(status)
-    if q.strip():
-        term=f'%{q.strip()}%'; clauses.append('(u.username LIKE ? OR u.full_name LIKE ? OR u.email LIKE ? OR u.pma_id LIKE ?)'); params.extend([term,term,term,term])
-    if clauses: sql+=' WHERE '+' AND '.join(clauses)
-    sql+=" ORDER BY CASE cm.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, CASE WHEN COALESCE(cm.featured,0)=1 THEN 0 ELSE 1 END, u.username COLLATE NOCASE"
+    c=db(); sql="SELECT u.id,u.username,u.full_name,u.email,u.pma_id,u.profile_picture,u.last_active,u.role AS account_role, cm.status,cm.role AS community_role,cm.warning_count,cm.suspended_until,cm.joined_at,cm.note FROM users u JOIN community_members cm ON cm.user_id=u.id"; params=[]
+    if status: sql+=' WHERE cm.status=?'; params.append(status)
+    sql+=" ORDER BY CASE cm.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, u.username COLLATE NOCASE"
     rows=c.execute(sql,params).fetchall(); c.close(); return {'members':[dict(r) for r in rows]}
-
-@app.post('/api/admin/community/feature')
-def community_feature(req: Request, x: dict):
-    u=current(req)
-    if u['role']!='admin': raise HTTPException(403,'Admin access required.')
-    uid=int(x.get('user_id') or 0); featured=bool(x.get('featured',False)); c=db(); target=c.execute("SELECT u.username FROM users u JOIN community_members cm ON cm.user_id=u.id WHERE u.id=? AND cm.status='approved'",(uid,)).fetchone()
-    if not target: c.close(); raise HTTPException(404,'Approved community member not found.')
-    if featured:
-        c.execute('UPDATE community_members SET featured=0 WHERE featured=1')
-    c.execute('UPDATE community_members SET featured=?,updated_at=? WHERE user_id=?',(1 if featured else 0,int(time.time()),uid)); c.commit(); c.close(); return {'ok':True,'featured':featured}
 
 @app.post('/api/admin/community/moderate')
 def moderate_community(req: Request, x: CommunityModeration):
