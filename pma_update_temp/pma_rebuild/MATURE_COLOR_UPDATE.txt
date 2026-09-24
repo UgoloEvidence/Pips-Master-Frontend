@@ -1,7 +1,0 @@
-PMA visual update
-- Removed the purple/violet visual system.
-- Added a persistent 5-image background carousel using the supplied AI trader image plus four existing market/analytics image sources.
-- Carousel changes every 10 seconds with a 1-second cross-fade and continues across SPA section navigation without restarting.
-- Dark theme uses restrained charcoal/graphite/slate/copper/sage accents.
-- Light theme uses clean white/soft-blue/graphite/copper accents.
-- BUY remains green, SELL red, NEUTRAL amber.
